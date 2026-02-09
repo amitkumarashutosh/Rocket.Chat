@@ -8,7 +8,7 @@ export function parseV2(input: string) {
 	const parser = new MessageParser();
 	parser.input = lexResult.tokens;
 
-	const cst = parser.document?.();
+	const cst = parser.document();
 
 	return buildAst(cst);
 }

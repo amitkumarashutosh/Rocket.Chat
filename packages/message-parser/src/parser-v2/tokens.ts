@@ -23,7 +23,7 @@ export const GreaterThan = createToken({
 
 export const Text = createToken({
 	name: 'Text',
-	pattern: /[^*`>\s]+/,
+	pattern: /[^*`\n>]+/,
 });
 
 export const Newline = createToken({
