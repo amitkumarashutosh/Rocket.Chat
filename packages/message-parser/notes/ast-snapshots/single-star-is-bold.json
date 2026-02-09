@@ -1,0 +1,20 @@
+{
+	"input": "*italic*",
+	"note": "Single star is parsed as BOLD, not italic",
+	"output": [
+		{
+			"type": "PARAGRAPH",
+			"value": [
+				{
+					"type": "BOLD",
+					"value": [
+						{
+							"type": "PLAIN_TEXT",
+							"value": "italic"
+						}
+					]
+				}
+			]
+		}
+	]
+}

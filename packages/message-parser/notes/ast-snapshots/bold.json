@@ -1,0 +1,19 @@
+{
+	"input": "**hello**",
+	"output": [
+		{
+			"type": "PARAGRAPH",
+			"value": [
+				{
+					"type": "BOLD",
+					"value": [
+						{
+							"type": "PLAIN_TEXT",
+							"value": "hello"
+						}
+					]
+				}
+			]
+		}
+	]
+}

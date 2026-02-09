@@ -1,0 +1,14 @@
+{
+	"input": "normal text",
+	"output": [
+		{
+			"type": "PARAGRAPH",
+			"value": [
+				{
+					"type": "PLAIN_TEXT",
+					"value": "normal text"
+				}
+			]
+		}
+	]
+}

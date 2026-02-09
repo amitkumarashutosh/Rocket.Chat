@@ -41,7 +41,8 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"tldts": "~6.1.86"
+		"tldts": "~6.1.86",
+		"tsx": "^4.21.0"
 	},
 	"devDependencies": {
 		"@rocket.chat/eslint-config": "workspace:^",

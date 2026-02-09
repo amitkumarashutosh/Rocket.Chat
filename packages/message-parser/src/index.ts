@@ -1,5 +1,7 @@
 import type { Root } from './definitions';
-import * as grammar from './grammar.pegjs';
+// import * as grammar from './grammar.pegjs';
+//@ts-ignore
+import * as grammar from './grammar.js';
 
 export * from './definitions';
 

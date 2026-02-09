@@ -1,0 +1,15 @@
+{
+	"input": "broken **bold",
+	"note": "Unclosed formatting markers are treated as literal text",
+	"output": [
+		{
+			"type": "PARAGRAPH",
+			"value": [
+				{
+					"type": "PLAIN_TEXT",
+					"value": "broken **bold"
+				}
+			]
+		}
+	]
+}

@@ -1,0 +1,17 @@
+{
+	"input": "`code`",
+	"output": [
+		{
+			"type": "PARAGRAPH",
+			"value": [
+				{
+					"type": "INLINE_CODE",
+					"value": {
+						"type": "PLAIN_TEXT",
+						"value": "code"
+					}
+				}
+			]
+		}
+	]
+}

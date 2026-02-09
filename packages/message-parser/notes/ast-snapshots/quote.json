@@ -1,0 +1,19 @@
+{
+	"input": "> quoted text",
+	"output": [
+		{
+			"type": "QUOTE",
+			"value": [
+				{
+					"type": "PARAGRAPH",
+					"value": [
+						{
+							"type": "PLAIN_TEXT",
+							"value": "quoted text"
+						}
+					]
+				}
+			]
+		}
+	]
+}
