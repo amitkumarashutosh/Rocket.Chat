@@ -1,14 +1,17 @@
 import { MessageLexer } from './lexer';
 import { MessageParser } from './parser';
-import { buildAst } from './astBuilder';
+
+const parser = new MessageParser();
 
 export function parseV2(input: string) {
 	const lexResult = MessageLexer.tokenize(input);
 
-	const parser = new MessageParser();
+	if (lexResult.errors.length > 0) {
+		throw new Error('Lexing error');
+	}
+
+	parser.reset();
 	parser.input = lexResult.tokens;
 
-	const cst = parser.document();
-
-	return buildAst(cst);
+	return parser.document();
 }

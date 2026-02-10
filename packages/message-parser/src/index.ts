@@ -34,7 +34,7 @@ export const parse = (input: string, options?: Options): Root => {
 	return grammar.parse(input, options);
 };
 
-// peggy.js parser
+// peggy.js
 // export const parse = (input: string, options?: Options): Root => grammar.parse(input, options);
 
 export {

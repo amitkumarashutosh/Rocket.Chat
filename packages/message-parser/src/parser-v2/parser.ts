@@ -1,13 +1,13 @@
-import { CstParser, CstNode } from 'chevrotain';
+import { EmbeddedActionsParser } from 'chevrotain';
 import { Text, Newline, Star, Backtick, GreaterThan } from './tokens';
 
-export class MessageParser extends CstParser {
-	public document!: () => CstNode;
-	public paragraph!: () => CstNode;
-	public inline!: () => CstNode;
-	public bold!: () => CstNode;
-	public inlineCode!: () => CstNode;
-	public quote!: () => CstNode;
+export class MessageParser extends EmbeddedActionsParser {
+	public document!: () => any[];
+	public paragraph!: () => any;
+	public inline!: () => any;
+	public bold!: () => any;
+	public inlineCode!: () => any;
+	public quote!: () => any;
 
 	constructor() {
 		super(
@@ -19,7 +19,7 @@ export class MessageParser extends CstParser {
 				GreaterThan,
 			},
 			{
-				recoveryEnabled: true,
+				recoveryEnabled: false, // 🔥 IMPORTANT
 			},
 		);
 
@@ -27,58 +27,112 @@ export class MessageParser extends CstParser {
 
 		// document := (quote | paragraph)*
 		$.RULE('document', () => {
+			const blocks: any[] = [];
+
 			$.MANY(() => {
-				$.OR([{ ALT: () => $.SUBRULE($.quote) }, { ALT: () => $.SUBRULE($.paragraph) }]);
+				blocks.push($.OR([{ ALT: () => $.SUBRULE($.quote) }, { ALT: () => $.SUBRULE($.paragraph) }]));
 			});
+
+			return blocks;
 		});
 
 		// quote := '>' paragraph
 		$.RULE('quote', () => {
 			$.CONSUME(GreaterThan);
-			$.SUBRULE($.paragraph);
+			const paragraph = $.SUBRULE($.paragraph);
+
+			return {
+				type: 'QUOTE',
+				value: [paragraph],
+			};
 		});
 
 		// paragraph := inline* Newline?
 		$.RULE('paragraph', () => {
-			$.MANY1(() => {
-				$.SUBRULE($.inline);
+			const inlines: any[] = [];
+
+			$.MANY(() => {
+				inlines.push($.SUBRULE($.inline));
 			});
+
 			$.OPTION(() => {
 				$.CONSUME(Newline);
 			});
+
+			return {
+				type: 'PARAGRAPH',
+				value: inlines,
+			};
 		});
 
 		// inline := inlineCode | bold | Text | Star
 		$.RULE('inline', () => {
-			$.OR([
+			return $.OR([
 				{ ALT: () => $.SUBRULE($.inlineCode) },
 				{ ALT: () => $.SUBRULE($.bold) },
-				{ ALT: () => $.CONSUME(Text) },
-				{ ALT: () => $.CONSUME(Star) }, // fail-soft
+				{
+					ALT: () => ({
+						type: 'PLAIN_TEXT',
+						value: $.CONSUME(Text).image,
+					}),
+				},
+				{
+					// fail-soft star
+					ALT: () => ({
+						type: 'PLAIN_TEXT',
+						value: $.CONSUME(Star).image,
+					}),
+				},
 			]);
 		});
 
 		// bold := '**' Text* '**' | '*' Text* '*'
 		$.RULE('bold', () => {
-			$.OR([
+			return $.OR([
 				{
 					ALT: () => {
 						$.CONSUME1(Star);
 						$.CONSUME2(Star);
-						$.MANY2(() => {
-							$.CONSUME1(Text);
+
+						const parts: string[] = [];
+						$.MANY(() => {
+							parts.push($.CONSUME(Text).image);
 						});
+
 						$.CONSUME3(Star);
 						$.CONSUME4(Star);
+
+						return {
+							type: 'BOLD',
+							value: [
+								{
+									type: 'PLAIN_TEXT',
+									value: parts.join(''),
+								},
+							],
+						};
 					},
 				},
 				{
 					ALT: () => {
 						$.CONSUME5(Star);
-						$.MANY3(() => {
-							$.CONSUME2(Text);
+
+						const parts: string[] = [];
+						$.MANY2(() => {
+							parts.push($.CONSUME2(Text).image);
 						});
+
 						$.CONSUME6(Star);
+
+						return {
+							type: 'BOLD',
+							value: [
+								{
+									type: 'PLAIN_TEXT',
+									value: parts.join(''),
+								},
+							],
+						};
 					},
 				},
 			]);
@@ -87,10 +141,21 @@ export class MessageParser extends CstParser {
 		// inlineCode := '`' Text* '`'
 		$.RULE('inlineCode', () => {
 			$.CONSUME1(Backtick);
-			$.MANY4(() => {
-				$.CONSUME3(Text);
+
+			const parts: string[] = [];
+			$.MANY(() => {
+				parts.push($.CONSUME(Text).image);
 			});
+
 			$.CONSUME2(Backtick);
+
+			return {
+				type: 'INLINE_CODE',
+				value: {
+					type: 'PLAIN_TEXT',
+					value: parts.join(''),
+				},
+			};
 		});
 
 		this.performSelfAnalysis();
