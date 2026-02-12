@@ -1,11 +1,11 @@
 import fc from 'fast-check';
-import { parseV2 } from '../src/parser-v2';
+import { parse } from '../src/index';
 
 console.log('Running parser-v2 fuzz test…');
 
 fc.assert(
 	fc.property(fc.string(), (input) => {
-		parseV2(input);
+		parse(input);
 	}),
 	{
 		numRuns: 10_000,

@@ -1,6 +1,6 @@
-const pegjs = require('peggy');
+import pegjs from 'peggy';
 
-module.exports = {
+export default {
 	process: (content) => ({
 		code: pegjs.generate(content, {
 			output: 'source',

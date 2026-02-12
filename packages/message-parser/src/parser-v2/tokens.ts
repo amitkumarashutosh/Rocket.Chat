@@ -1,34 +1,37 @@
 import { createToken } from 'chevrotain';
 
-export const WhiteSpace = createToken({
-	name: 'WhiteSpace',
-	pattern: /\s+/,
-	group: 'SKIPPED',
+export const NewLine = createToken({
+	name: 'NewLine',
+	pattern: /\r\n|\n|\r/,
 });
 
-export const Star = createToken({
-	name: 'Star',
-	pattern: /\*/,
+export const HeadingHash = createToken({
+	name: 'HeadingHash',
+	pattern: /#{1,4}(?=\s)/,
+	line_breaks: false,
+	start_chars_hint: ['#'],
 });
 
-export const Backtick = createToken({
-	name: 'Backtick',
-	pattern: /`/,
-});
+// export const MentionChannel = createToken({
+// 	name: 'MentionChannel',
+// 	pattern: /(?<=^|\s)#[a-zA-Z0-9_]+/,
+// });
 
-export const GreaterThan = createToken({
-	name: 'GreaterThan',
-	pattern: />/,
+export const Space = createToken({
+	name: 'Space',
+	pattern: /[ \t]+/,
 });
 
 export const Text = createToken({
 	name: 'Text',
-	pattern: /[^*`\n>]+/,
+	pattern: /[^#\n]+/,
 });
 
-export const Newline = createToken({
-	name: 'Newline',
-	pattern: /\n/,
+export const Hash = createToken({
+	name: 'Hash',
+	pattern: /#/,
+	longer_alt: HeadingHash,
 });
 
-export const allTokens = [WhiteSpace, Newline, Star, Backtick, GreaterThan, Text];
+// NOTE: Order matters
+export const allTokens = [NewLine, HeadingHash, Hash, Space, Text];

@@ -1,6 +1,7 @@
 {
 	"name": "@rocket.chat/message-parser",
 	"version": "0.31.32",
+	"type": "module",
 	"description": "Rocket.Chat parser for messages",
 	"homepage": "https://github.com/RocketChat/fuselage#readme",
 	"bugs": {
@@ -42,6 +43,7 @@
 		"bench": "tsx benchmarks/parser.bench.ts"
 	},
 	"dependencies": {
+		"chevrotain": "^10.4.1",
 		"tldts": "~6.1.86",
 		"tsx": "^4.21.0"
 	},
