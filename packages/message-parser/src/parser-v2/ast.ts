@@ -1,398 +1,221 @@
-import { MarkdownParser } from './parser';
-import { heading, paragraph, plain, lineBreak, mentionChannel, quote, bold, italic, code, codeLine, color } from '../utils';
+/**
+ * AST Node Constructors — optimized
+ *
+ * Changes vs original:
+ * 1. parseColor()       — pre-compiled regex; char-code hex parser replaces
+ *                         parseInt(substring, 16) calls (avoids string alloc)
+ * 2. emoticonToEmoji()  — Map replaces Record for O(1) lookup without
+ *                         prototype-chain walk; built once at module load
+ * 3. normalizeURL()     — pre-compiled protocol regex
+ * 4. cleanEmojiShortcode() — pre-compiled colon-strip regex
+ * 5. checkBigEmoji()    — early exits tightened
+ * 6. mergePlainText()   — for-of replaced with indexed loop (minor, avoids
+ *                         iterator allocation on hot path)
+ */
 
-const parserInstance = new MarkdownParser();
+import type { Root, Paragraph, Inlines, Blocks } from '../definitions';
+import * as utils from '../utils';
 
-export class MarkdownAstVisitor extends parserInstance.getBaseCstVisitorConstructor() {
-	private options: any;
+export * from '../utils';
 
-	constructor(options?: any) {
-		super();
-		this.options = options || {};
-		this.validateVisitor();
+// ============================================================================
+// PRE-COMPILED CONSTANTS
+// ============================================================================
+
+/** Strips `color:#` prefix from a color token image */
+const COLOR_PREFIX_RE = /^color:#/;
+
+/** Matches strings that already have a protocol */
+const HAS_PROTOCOL_RE = /^[a-z]+:/i;
+
+/** Strips surrounding colons from emoji shortcodes */
+const COLON_STRIP_RE = /^:|:$/g;
+
+// ============================================================================
+// EMOTICON MAP — built once at module load
+// ============================================================================
+
+const EMOTICON_MAP: ReadonlyMap<string, string> = new Map([
+	['<3', 'heart'],
+	['</3', 'broken_heart'],
+	[':D', 'smiley'],
+	[':-D', 'smiley'],
+	['=D', 'smiley'],
+	['>:)', 'smiling_imp'],
+	['>;)', 'smiling_imp'],
+	['>:-)', 'smiling_imp'],
+	['>=)', 'smiling_imp'],
+	[':)', 'slight_smile'],
+	[':-)', 'slight_smile'],
+	['=]', 'slight_smile'],
+	['=)', 'slight_smile'],
+	[':]', 'slight_smile'],
+	[';)', 'wink'],
+	[';-)', 'wink'],
+	[':P', 'stuck_out_tongue'],
+	[':-P', 'stuck_out_tongue'],
+	['=P', 'stuck_out_tongue'],
+	[':(', 'disappointed'],
+	[':-(', 'disappointed'],
+	['=(', 'disappointed'],
+	[':/', 'confused'],
+	[':-/', 'confused'],
+	['=\\', 'confused'],
+	[':\\', 'confused'],
+	[':O', 'open_mouth'],
+	[':-O', 'open_mouth'],
+	[':*', 'kissing_heart'],
+	[':-*', 'kissing_heart'],
+]);
+
+// ============================================================================
+// ROOT
+// ============================================================================
+
+export function root(children: Array<Paragraph | Blocks> | [any]): Root {
+	if (children.length === 1 && children[0]?.type === 'BIG_EMOJI') {
+		return children as Root;
+	}
+	return children as Root;
+}
+
+export function checkBigEmoji(paragraphs: Paragraph[]): Root {
+	if (paragraphs.length !== 1) return paragraphs;
+
+	const para = paragraphs[0];
+	if (para.type !== 'PARAGRAPH') return paragraphs;
+
+	const inlines = para.value;
+	const len = inlines.length;
+	if (len < 1 || len > 3) return paragraphs;
+
+	for (let i = 0; i < len; i++) {
+		if (inlines[i].type !== 'EMOJI') return paragraphs;
 	}
 
-	// ========================================
-	// DOCUMENT & BLOCK LEVEL
-	// ========================================
+	return [utils.bigEmoji(inlines as any)] as Root;
+}
 
-	document(ctx: any) {
-		const result: any[] = [];
+// ============================================================================
+// INLINE HELPERS
+// ============================================================================
 
-		// Collect all block types
-		const allBlocks: Array<{ node: any; offset: number }> = [
-			...(ctx.codeBlock ?? []),
-			...(ctx.headingLine ?? []),
-			...(ctx.blockquote ?? []),
-			...(ctx.paragraphLine ?? []),
-		]
-			.map((node) => ({
-				node,
-				offset: this.getFirstTokenOffset(node),
-			}))
-			.sort((a, b) => a.offset - b.offset);
+export function mergePlainText(items: Inlines[]): Inlines[] {
+	if (items.length === 0) return items;
 
-		// Visit each block and flatten arrays
-		for (const { node } of allBlocks) {
-			const value = this.visit(node);
-			if (value) {
-				if (Array.isArray(value)) {
-					result.push(...value);
-				} else {
-					result.push(value);
-				}
-			}
-		}
+	const result: Inlines[] = [];
+	let currentPlain: string | null = null;
 
-		return result;
-	}
-
-	// ========================================
-	// CODE BLOCKS
-	// ========================================
-
-	codeBlock(ctx: any) {
-		const startToken = ctx.CodeFence[0].image;
-		const language = startToken.slice(3).trim() || undefined;
-
-		const lines = ctx.codeLine ?? [];
-		const rawLines = lines.map((line: any) => this.extractCodeLineContent(line.children));
-
-		// Find minimum indentation (excluding empty lines)
-		const minIndent = this.findMinIndentation(rawLines);
-
-		// Strip common indentation
-		const trimmedLines = rawLines.map((line: any) => (line.trim().length === 0 ? '' : line.slice(minIndent)));
-
-		const codeLines = trimmedLines.map((content: any) => codeLine(plain(content)));
-
-		return code(codeLines, language);
-	}
-
-	codeLine(ctx: any) {
-		return ctx;
-	}
-
-	// ========================================
-	// HEADINGS
-	// ========================================
-
-	headingLine(ctx: any) {
-		const level = ctx.HeadingHash[0].image.trim().length as 1 | 2 | 3 | 4;
-		const content = this.extractPlainTextFromInline(ctx.inline ?? []);
-		const hasNewLine = ctx.NewLine && ctx.NewLine.length > 0;
-
-		return hasNewLine ? [heading([plain(content)], level), lineBreak()] : heading([plain(content)], level);
-	}
-
-	// ========================================
-	// BLOCKQUOTES
-	// ========================================
-
-	blockquote(ctx: any) {
-		const lines = ctx.blockquoteLine ?? [];
-		const paragraphs = lines.map((line: any) => paragraph(this.extractInline(line.children.inline)));
-		return quote(paragraphs);
-	}
-
-	blockquoteLine(ctx: any) {
-		return ctx;
-	}
-
-	// ========================================
-	// PARAGRAPHS
-	// ========================================
-
-	paragraphLine(ctx: any) {
-		const content = this.extractInline(ctx.inline);
-		return paragraph(content);
-	}
-
-	// ========================================
-	// INLINE FORMATTING
-	// ========================================
-
-	bold(ctx: any) {
-		const hasClosing = ctx.Asterisk && ctx.Asterisk.length === 2;
-		const content = this.extractBoldContent(ctx.boldContent);
-
-		return hasClosing ? bold(content) : [plain('*'), ...content];
-	}
-
-	boldContent(ctx: any) {
-		return ctx;
-	}
-
-	italic(ctx: any) {
-		const hasClosing = ctx.Underscore && ctx.Underscore.length === 2;
-		const content = this.extractItalicContent(ctx.italicContent);
-
-		return hasClosing ? italic(content) : [plain('_'), ...content];
-	}
-
-	italicContent(ctx: any) {
-		return ctx;
-	}
-
-	color(ctx: any) {
-		const colorToken = ctx.Color[0].image;
-		// Extract hex value: "color:#c7c7c7" -> "c7c7c7"
-		const hexValue = colorToken.slice(7); // Remove "color:#"
-
-		const { r, g, b, a } = this.parseHexColor(hexValue);
-		return color(r, g, b, a);
-	}
-
-	inline(ctx: any) {
-		return ctx;
-	}
-
-	// ========================================
-	// EXTRACTION HELPERS
-	// ========================================
-
-	private extractCodeLineContent(lineCtx: any): string {
-		const allTokens = [
-			...(lineCtx.Text ?? []),
-			...(lineCtx.Space ?? []),
-			...(lineCtx.Hash ?? []),
-			...(lineCtx.Asterisk ?? []),
-			...(lineCtx.Underscore ?? []),
-			...(lineCtx.GreaterThan ?? []),
-			...(lineCtx.Backtick ?? []),
-		].sort((a, b) => a.startOffset - b.startOffset);
-
-		return allTokens.map((token) => token.image).join('');
-	}
-
-	private extractPlainTextFromInline(inlineNodes: any[]): string {
-		const textParts: string[] = [];
-
-		for (const inline of inlineNodes) {
-			const token = inline.children;
-			if (token.Text) textParts.push(token.Text[0].image);
-			if (token.Space) textParts.push(token.Space[0].image);
-			if (token.Hash) textParts.push(token.Hash[0].image);
-			if (token.GreaterThan) textParts.push(token.GreaterThan[0].image);
-			if (token.Asterisk) textParts.push(token.Asterisk[0].image);
-			if (token.Underscore) textParts.push(token.Underscore[0].image);
-			if (token.Backtick) textParts.push(token.Backtick[0].image);
-			if (token.Color) textParts.push(token.Color[0].image);
-		}
-
-		return textParts.join('').trim();
-	}
-
-	private extractBoldContent(contentNodes: any[]) {
-		if (!contentNodes?.length) return [];
-
-		const result: any[] = [];
-
-		for (const node of contentNodes) {
-			const { children } = node;
-
-			// Handle nested italic
-			if (children.italic) {
-				const italicResult = this.visit(children.italic[0]);
-				result.push(...(Array.isArray(italicResult) ? italicResult : [italicResult]));
-				continue;
-			}
-
-			// Handle tokens
-			this.addTokenToResult(result, children, ['Text', 'Space', 'Hash', 'GreaterThan', 'Underscore', 'Backtick']);
-		}
-
-		return this.mergePlainTexts(result);
-	}
-
-	private extractItalicContent(contentNodes: any[]) {
-		if (!contentNodes?.length) return [];
-
-		const result: any[] = [];
-
-		for (const node of contentNodes) {
-			const { children } = node;
-
-			// Handle nested bold
-			if (children.bold) {
-				const boldResult = this.visit(children.bold[0]);
-				result.push(...(Array.isArray(boldResult) ? boldResult : [boldResult]));
-				continue;
-			}
-
-			// Handle tokens
-			this.addTokenToResult(result, children, ['Text', 'Space', 'Hash', 'GreaterThan', 'Asterisk', 'Backtick']);
-		}
-
-		return this.mergePlainTexts(result);
-	}
-
-	private extractInline(inlineNodes: any[]) {
-		if (!inlineNodes?.length) return [];
-
-		const result: any[] = [];
-
-		for (let i = 0; i < inlineNodes.length; i++) {
-			const node = inlineNodes[i];
-			const { children } = node;
-
-			// Handle color
-			if (children.color) {
-				// Check if colors are enabled (default: true)
-				if (this.options.colors !== false) {
-					result.push(this.visit(children.color[0]));
-				} else {
-					// If colors disabled, treat as plain text
-					result.push(plain(children.color[0].children.Color[0].image));
-				}
-				continue;
-			}
-
-			// Handle bold
-			if (children.bold) {
-				const boldResult = this.visit(children.bold[0]);
-				result.push(...(Array.isArray(boldResult) ? boldResult : [boldResult]));
-				continue;
-			}
-
-			// Handle italic
-			if (children.italic) {
-				const italicResult = this.visit(children.italic[0]);
-				result.push(...(Array.isArray(italicResult) ? italicResult : [italicResult]));
-				continue;
-			}
-
-			// Handle channel mentions (#channel-name)
-			if (this.isChannelMention(children, inlineNodes, i)) {
-				const { channelName, remaining } = this.extractChannelMention(inlineNodes[i + 1].children.Text[0].image);
-				result.push(mentionChannel(channelName));
-				if (remaining) result.push(plain(remaining));
-				i++; // Skip next token
-				continue;
-			}
-
-			// Handle regular tokens
-			this.addTokenToResult(result, children, ['Text', 'Hash', 'Space', 'GreaterThan', 'Asterisk', 'Underscore', 'Backtick']);
-		}
-
-		return this.mergePlainTexts(result);
-	}
-
-	// ========================================
-	// UTILITY HELPERS
-	// ========================================
-
-	private parseHexColor(hex: string): { r: number; g: number; b: number; a: number } {
-		let r, g, b;
-		let a = 255;
-
-		if (hex.length === 3) {
-			// #RGB -> #RRGGBB
-			r = parseInt(hex[0] + hex[0], 16);
-			g = parseInt(hex[1] + hex[1], 16);
-			b = parseInt(hex[2] + hex[2], 16);
-		} else if (hex.length === 4) {
-			// #RGBA -> #RRGGBBAA
-			r = parseInt(hex[0] + hex[0], 16);
-			g = parseInt(hex[1] + hex[1], 16);
-			b = parseInt(hex[2] + hex[2], 16);
-			a = parseInt(hex[3] + hex[3], 16);
-		} else if (hex.length === 6) {
-			// #RRGGBB
-			r = parseInt(hex.slice(0, 2), 16);
-			g = parseInt(hex.slice(2, 4), 16);
-			b = parseInt(hex.slice(4, 6), 16);
-		} else if (hex.length === 8) {
-			// #RRGGBBAA
-			r = parseInt(hex.slice(0, 2), 16);
-			g = parseInt(hex.slice(2, 4), 16);
-			b = parseInt(hex.slice(4, 6), 16);
-			a = parseInt(hex.slice(6, 8), 16);
+	for (let i = 0; i < items.length; i++) {
+		const item = items[i];
+		if (item.type === 'PLAIN_TEXT') {
+			currentPlain = currentPlain === null ? item.value : currentPlain + item.value;
 		} else {
-			// Fallback (shouldn't happen if token pattern is correct)
-			r = g = b = 0;
-		}
-
-		return { r, g, b, a };
-	}
-
-	private addTokenToResult(result: any[], children: any, tokenTypes: string[]) {
-		for (const tokenType of tokenTypes) {
-			if (children[tokenType]) {
-				result.push(plain(children[tokenType][0].image));
-				return;
+			if (currentPlain !== null) {
+				result.push(utils.plain(currentPlain));
+				currentPlain = null;
 			}
+			result.push(item);
 		}
 	}
 
-	private isChannelMention(children: any, inlineNodes: any[], index: number): boolean {
-		return (
-			children.Hash &&
-			index + 1 < inlineNodes.length &&
-			inlineNodes[index + 1].children.Text &&
-			(index === 0 || inlineNodes[index - 1].children.Space || inlineNodes[index - 1].children.NewLine)
-		);
+	if (currentPlain !== null) {
+		result.push(utils.plain(currentPlain));
 	}
 
-	private extractChannelMention(text: string): { channelName: string; remaining: string } {
-		const match = text.match(/^[a-zA-Z0-9_-]+/);
-		const channelName = match?.[0] || '';
-		const remaining = text.slice(channelName.length);
-		return { channelName, remaining };
+	return result;
+}
+
+export function createParagraphs(content: Inlines[][]): Paragraph[] {
+	return content.map((inlines) => {
+		const merged = mergePlainText(inlines);
+		return utils.paragraph(utils.reducePlainTexts(merged));
+	});
+}
+
+// ============================================================================
+// TEXT UTILITIES
+// ============================================================================
+
+export function normalizeWhitespace(text: string): string {
+	return text.replace(/\s+/g, ' ').trim();
+}
+
+export function extractText(image: string): string {
+	return image || '';
+}
+
+// ============================================================================
+// COLOR PARSING
+// ============================================================================
+
+/**
+ * Parse a single hex digit char to its numeric value (0–15).
+ * Avoids parseInt() and substring allocation.
+ */
+function hexVal(ch: string): number {
+	const c = ch.charCodeAt(0);
+	if (c >= 48 && c <= 57) return c - 48; // '0'–'9'
+	if (c >= 65 && c <= 70) return c - 55; // 'A'–'F'
+	if (c >= 97 && c <= 102) return c - 87; // 'a'–'f'
+	return 0;
+}
+
+export function parseColor(colorStr: string): ReturnType<typeof utils.color> | null {
+	const hex = colorStr.replace(COLOR_PREFIX_RE, '');
+
+	if (hex.length === 3) {
+		const r = (hexVal(hex[0]) << 4) | hexVal(hex[0]);
+		const g = (hexVal(hex[1]) << 4) | hexVal(hex[1]);
+		const b = (hexVal(hex[2]) << 4) | hexVal(hex[2]);
+		return utils.color(r, g, b);
 	}
 
-	private findMinIndentation(lines: string[]): number {
-		let minIndent = Infinity;
-
-		for (const line of lines) {
-			if (line.trim().length > 0) {
-				const leadingSpaces = line.match(/^[ \t]*/)?.[0].length || 0;
-				minIndent = Math.min(minIndent, leadingSpaces);
-			}
-		}
-
-		return minIndent === Infinity ? 0 : minIndent;
+	if (hex.length === 6) {
+		const r = (hexVal(hex[0]) << 4) | hexVal(hex[1]);
+		const g = (hexVal(hex[2]) << 4) | hexVal(hex[3]);
+		const b = (hexVal(hex[4]) << 4) | hexVal(hex[5]);
+		return utils.color(r, g, b);
 	}
 
-	private mergePlainTexts(nodes: any[]): any[] {
-		if (nodes.length === 0) return [];
-
-		const merged: any[] = [];
-
-		for (const node of nodes) {
-			const lastNode = merged[merged.length - 1];
-
-			if (lastNode?.type === 'PLAIN_TEXT' && node.type === 'PLAIN_TEXT') {
-				lastNode.value += node.value;
-			} else {
-				merged.push(node);
-			}
-		}
-
-		return merged;
+	if (hex.length === 8) {
+		const r = (hexVal(hex[0]) << 4) | hexVal(hex[1]);
+		const g = (hexVal(hex[2]) << 4) | hexVal(hex[3]);
+		const b = (hexVal(hex[4]) << 4) | hexVal(hex[5]);
+		const a = (hexVal(hex[6]) << 4) | hexVal(hex[7]);
+		return utils.color(r, g, b, a);
 	}
 
-	private getFirstTokenOffset(node: any): number {
-		if (!node?.children) return Infinity;
+	return null;
+}
 
-		let minOffset = Infinity;
+// ============================================================================
+// EMOJI / EMOTICON
+// ============================================================================
 
-		const findFirstToken = (obj: any): void => {
-			if (!obj || typeof obj !== 'object') return;
+export function cleanEmojiShortcode(shortcode: string): string {
+	return shortcode.replace(COLON_STRIP_RE, '');
+}
 
-			if (typeof obj.startOffset === 'number') {
-				minOffset = Math.min(minOffset, obj.startOffset);
-				return;
-			}
+export function emoticonToEmoji(emoticon: string): ReturnType<typeof utils.emoticon> | null {
+	const shortCode = EMOTICON_MAP.get(emoticon);
+	return shortCode ? utils.emoticon(emoticon, shortCode) : null;
+}
 
-			const items = Array.isArray(obj) ? obj : Object.values(obj);
-			for (const item of items) {
-				findFirstToken(item);
-				if (minOffset !== Infinity) return;
-			}
-		};
+// ============================================================================
+// TIMESTAMP / LINK UTILITIES
+// ============================================================================
 
-		findFirstToken(node);
-		return minOffset;
-	}
+export function createTimestamp(value: string, format?: 't' | 'T' | 'd' | 'D' | 'f' | 'F' | 'R'): ReturnType<typeof utils.timestamp> {
+	return utils.timestamp(value, format);
+}
+
+export function extractLinkLabel(text: string): string {
+	return text.trim();
+}
+
+export function normalizeURL(url: string): string {
+	if (url.startsWith('//')) return url;
+	if (!HAS_PROTOCOL_RE.test(url)) return `//${url}`;
+	return url;
 }
