@@ -14,12 +14,14 @@ type AddCustomSoundProps = {
 	onChange: () => void;
 };
 
+type SoundFile = File | null;
+
 const AddCustomSound = ({ goToNew, close, onChange, ...props }: AddCustomSoundProps): ReactElement => {
 	const { t } = useTranslation();
 	const dispatchToastMessage = useToastMessageDispatch();
 
 	const [name, setName] = useState('');
-	const [sound, setSound] = useState<{ name: string }>();
+	const [sound, setSound] = useState<SoundFile>(null);
 
 	const uploadCustomSound = useMethod('uploadCustomSound');
 	const insertOrUpdateSound = useMethod('insertOrUpdateSound');
@@ -31,8 +33,11 @@ const AddCustomSound = ({ goToNew, close, onChange, ...props }: AddCustomSoundPr
 	const [clickUpload] = useSingleFileInput(handleChangeFile, 'audio/mp3');
 
 	const saveAction = useCallback(
-		// FIXME
-		async (name: string, soundFile: any) => {
+		async (name: string, soundFile: SoundFile) => {
+			if (!soundFile) {
+				throw new Error(t('Required_field', { field: t('Sound_File_mp3') }));
+			}
+
 			const soundData = createSoundData(soundFile, name);
 			const validation = validate(soundData, soundFile) as Array<Parameters<typeof t>[0]>;
 
