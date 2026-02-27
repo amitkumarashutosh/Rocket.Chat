@@ -1,5 +1,6 @@
 import type { Root } from './definitions';
-import * as grammar from './grammar.pegjs';
+// import * as grammar from './grammar.pegjs';
+import { parse as parser } from './parser';
 
 export * from './definitions';
 
@@ -15,7 +16,8 @@ export type Options = {
 	customDomains?: string[];
 };
 
-export const parse = (input: string, options?: Options): Root => grammar.parse(input, options);
+// export const parse = (input: string, options?: Options): Root => grammar.parse(input, options);
+export const parse = (input: string, options?: Options): Root => parser(input, options);
 
 export {
 	/** @deprecated */
