@@ -118,7 +118,7 @@ function stripUrlTrailing(url: string): [string, string] {
 }
 
 function isWordChar(ch: string | undefined): boolean {
-	return ch !== undefined && /\w/.test(ch);
+	return ch !== undefined && /[a-zA-Z0-9]/.test(ch);
 }
 
 // =============================================================================
@@ -361,6 +361,7 @@ class Parser {
 
 		// Reject if preceded by word char (mid-word _ not italic)
 		const prevChar = savedPos > 0 ? this.stream.tokenAt(savedPos - 1)?.image?.slice(-1) : undefined;
+
 		if (isWordChar(prevChar)) return null;
 
 		this.stream.consume(); // first _
@@ -433,6 +434,13 @@ class Parser {
 			this.stream.setPos(savedPos);
 			return null;
 		}
+
+		const allWS = inner.every((n) => n.type === 'PLAIN_TEXT' && (n as any).value.trim() === '');
+		if (allWS) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
 		return italic(reducePlainTexts(inner) as any);
 	}
 
@@ -505,8 +513,15 @@ class Parser {
 	private parsePlainToken(): Inlines {
 		let text = this.stream.consume().image;
 
-		// Merge _ + Plain tokens for emails like joe_roe@joe.com
-		while (this.stream.checkImage(SpecialChar, '_') && this.stream.peekAt(1)?.tokenType.name === PlainToken.name) {
+		// Merge _ + Plain tokens for word-internal cases like joe_roe@joe.com
+		// but NOT when the Plain after _ starts with a space (that _ could be a closing italic)
+		while (
+			this.stream.checkImage(SpecialChar, '_') &&
+			this.stream.peekAt(1)?.tokenType.name === PlainToken.name &&
+			!/^\s/.test(this.stream.peekAt(1)!.image) &&
+			!/^_/.test(this.stream.peekAt(1)!.image) &&
+			/[a-zA-Z0-9]/.test(text.slice(-1))
+		) {
 			text += this.stream.consume().image;
 			text += this.stream.consume().image;
 		}
@@ -533,6 +548,12 @@ class Parser {
 			let emailIdx = emailMatch?.index ?? Infinity;
 			let phoneIdx = phoneMatch?.index ?? Infinity;
 			let mentionIdx = mentionMatch?.index ?? Infinity;
+
+			// Mention: reject if preceded by word char (e.g. italic@test should not match @test)
+			if (mentionMatch && mentionIdx !== Infinity) {
+				const cb = mentionIdx > 0 ? remaining[mentionIdx - 1] : prevChar;
+				if (/[a-zA-Z0-9]/.test(cb)) mentionIdx = Infinity;
+			}
 
 			// URL: reject if preceded by alphanumeric or dot
 			if (urlMatch && urlIdx !== Infinity) {
@@ -617,9 +638,13 @@ class Parser {
 				prevChar = phoneMatch![0].slice(-1);
 				remaining = remaining.slice(phoneIdx + phoneMatch![0].length);
 			} else if (minIdx === mentionIdx) {
-				results.push(mentionUser(mentionMatch![0].slice(1))); // strip @
-				prevChar = mentionMatch![0].slice(-1);
-				remaining = remaining.slice(mentionIdx + mentionMatch![0].length);
+				let mentionText = mentionMatch![0];
+				// Strip trailing underscores — they may be italic delimiters
+				const stripped = mentionText.replace(/_+$/, '');
+				const leftover = mentionText.slice(stripped.length);
+				results.push(mentionUser(stripped.slice(1))); // strip @
+				prevChar = stripped.slice(-1);
+				remaining = leftover + remaining.slice(mentionIdx + mentionText.length);
 			} else if (minIdx === emojiIdx) {
 				results.push(emoji(emojiMatch![0].slice(1, -1)));
 				prevChar = ':';
