@@ -2,24 +2,56 @@ import type { IToken } from 'chevrotain';
 
 import { MessageLexer, Escape, LiteralBackslash, DoubleNewLine, NewLine, Plain as PlainToken, SpecialChar } from './lexer';
 
-import { paragraph, plain, bold, lineBreak, reducePlainTexts, autoEmail, phoneChecker, link } from './utils';
+import {
+	paragraph,
+	plain,
+	bold,
+	italic,
+	strike,
+	lineBreak,
+	reducePlainTexts,
+	autoEmail,
+	autoLink,
+	phoneChecker,
+	link,
+	emoji,
+	emojiUnicode,
+	emoticon as emoticonNode,
+	mentionUser,
+	mentionChannel,
+	bigEmoji,
+	inlineCode,
+} from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
 import type { Options } from './index';
+import { EMOTICONS, EMOTICON_LIST } from './emoticons';
 
 // =============================================================================
-// INLINE PATTERNS — detected inside Plain tokens by the parser
-// Keeping these out of the lexer avoids Chevrotain lookbehind limitations
-// and correctly handles patterns embedded mid-sentence.
+// INLINE PATTERNS — all detected inside Plain tokens via splitPlainText()
+// The lexer does NOT have special tokens for these; they live in Plain text.
 // =============================================================================
 
-// Email: user@domain.tld — supports unicode, dots, underscores, apostrophes, +
+// @mention — unicode-aware, includes . @ : - in name
+const MENTION_USER_RE =
+	/@[\w\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF\u0E00-\u0E7F\u0900-\u097F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF][\w\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF\u0E00-\u0E7F\u0900-\u097F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF.@:-]*/;
+
+// Email
 const EMAIL_RE =
 	/(?:mailto:)?[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF'_.+-]+@[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF-]+\.[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF.-]+[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF]/;
 
-// Phone: +digits, +(digits)digits, +digits-digits
-// Lookbehind replaced with explicit char-before check in splitPlainText()
+// URL
+const URL_RE = /(?:(?:[a-zA-Z][a-zA-Z0-9+\-]*):\/\/|(?:www\.))[\S]+/;
+
+// Phone
 const PHONE_RE = /\+(\(\d+\)[\d-]*|\d[\d-]*)(?![.,\d])/;
+
+// Emoji shortcode: must be preceded by space/start/colon, followed by space/end/colon
+const EMOJI_CODE_RE = /:[a-zA-Z0-9_+\-]+:/g;
+
+// Unicode emoji sequences
+const UNICODE_EMOJI_RE =
+	/(?:\p{Emoji}\uFE0F|\p{Emoji_Presentation})\p{Emoji_Modifier}?(?:\u200D(?:\p{Emoji}\uFE0F|\p{Emoji_Presentation})\p{Emoji_Modifier}?)*/u;
 
 // =============================================================================
 // TOKEN STREAM
@@ -51,6 +83,9 @@ class TokenStream {
 	setPos(pos: number): void {
 		this.pos = pos;
 	}
+	tokenAt(i: number): IToken | undefined {
+		return this.tokens[i];
+	}
 
 	check(type: { name: string }): boolean {
 		return this.peek()?.tokenType.name === type.name;
@@ -68,30 +103,64 @@ class TokenStream {
 }
 
 // =============================================================================
-// PARSER
-// Hand-written recursive descent. Zero Chevrotain parser classes.
-//
-// Block level:
-//   parseMessage()       → blocks (paragraphs + line breaks)
-//   parseParagraph()     → PARAGRAPH containing inlines
-//
-// Inline level (via pending queue):
-//   nextInline()         → drains pending queue, then calls parseInline()
-//   parseInline()        → dispatcher
-//   parseEscape()        → \\* → plain("*")
-//   parsePlainToken()    → splits Plain token into email/phone/text nodes
-//   tryParseLink()       → [label](url)
-//   tryParseBold()       → **text** (used inside link labels)
-//   parseFallback()      → any token → plain text
+// HELPERS
 // =============================================================================
+
+function stripUrlTrailing(url: string): [string, string] {
+	let result = url;
+	while (result.length > 0) {
+		const last = result[result.length - 1];
+		if ('.!,'.includes(last)) result = result.slice(0, -1);
+		else if (last === ')' && !result.includes('(')) result = result.slice(0, -1);
+		else break;
+	}
+	return [result, url.slice(result.length)];
+}
+
+function isWordChar(ch: string | undefined): boolean {
+	return ch !== undefined && /\w/.test(ch);
+}
+
+// =============================================================================
+// BIG EMOJI POST-PROCESSOR
+// Check if the entire parsed result is 1-3 emoji/emoticon nodes (+ whitespace only)
+// =============================================================================
+
+function tryMakeBigEmoji(blocks: any[]): Root {
+	const emojis: any[] = [];
+
+	for (const block of blocks) {
+		if (block.type === 'LINE_BREAK') continue;
+		if (block.type !== 'PARAGRAPH') return blocks;
+
+		for (const node of block.value) {
+			if (node.type === 'PLAIN_TEXT') {
+				if (node.value.trim() !== '') return blocks; // non-whitespace text = not bigEmoji
+			} else if (node.type === 'EMOJI') {
+				emojis.push(node);
+			} else {
+				return blocks;
+			}
+		}
+	}
+
+	if (emojis.length === 0 || emojis.length > 3) return blocks;
+	return [bigEmoji(emojis as any)];
+}
+
+// =============================================================================
+// PARSER
+// =============================================================================
+
+type FormattingContext = {
+	inBold?: boolean;
+	inItalic?: boolean;
+	inStrike?: boolean;
+};
 
 class Parser {
 	private stream: TokenStream;
 	private options: Options;
-
-	// When a Plain token contains an email or phone mid-text, splitPlainText()
-	// produces multiple nodes. Extras are queued here and drained before the
-	// next token is consumed.
 	private pending: Inlines[] = [];
 
 	constructor(stream: TokenStream, options: Options = {}) {
@@ -107,7 +176,6 @@ class Parser {
 		const blocks: any[] = [];
 
 		while (!this.stream.isAtEnd()) {
-			// Newline run: N chars → (N-1) LINE_BREAK nodes between content
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) {
 				let count = 0;
 				while (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) {
@@ -123,7 +191,7 @@ class Parser {
 			if (para.value.length > 0) blocks.push(para);
 		}
 
-		return blocks;
+		return tryMakeBigEmoji(blocks);
 	}
 
 	private parseParagraph() {
@@ -131,7 +199,7 @@ class Parser {
 
 		while (!this.stream.isAtEnd() || this.pending.length > 0) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-			const node = this.nextInline();
+			const node = this.nextInline({});
 			if (node) inlines.push(node);
 		}
 
@@ -139,115 +207,244 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// INLINE — pending queue + dispatcher
+	// INLINE DISPATCHER
 	// ===========================================================================
 
-	// Always drain the pending queue before consuming a new token
-	private nextInline(): Inlines | null {
+	private nextInline(ctx: FormattingContext): Inlines | null {
 		if (this.pending.length > 0) return this.pending.shift()!;
-		return this.parseInline();
+		return this.parseInline(ctx);
 	}
 
-	private parseInline(): Inlines | null {
-		// Escape: \\* → plain("*")
+	private parseInline(ctx: FormattingContext): Inlines | null {
 		if (this.stream.check(Escape)) return this.parseEscape();
 
-		// Link: [label](url) — backtracking
-		if (this.stream.checkImage(SpecialChar, '[')) {
-			const node = this.tryParseLink();
+		// Bold *
+		if (this.stream.checkImage(SpecialChar, '*') && !ctx.inBold) {
+			const node = this.tryParseFormatting('*', ctx);
 			if (node) return node;
 		}
 
-		// Plain token — scan for embedded email / phone
+		// Italic _
+		if (this.stream.checkImage(SpecialChar, '_') && !ctx.inItalic) {
+			const node = this.tryParseItalic(ctx);
+			if (node) return node;
+		}
+
+		// Strike ~
+		if (this.stream.checkImage(SpecialChar, '~') && !ctx.inStrike) {
+			const node = this.tryParseFormatting('~', ctx);
+			if (node) return node;
+		}
+
+		// Inline Code
+		if (this.stream.checkImage(SpecialChar, '`')) {
+			const node = this.tryParseInlineCode();
+			if (node) return node;
+		}
+
+		// Link [label](url)
+		if (this.stream.checkImage(SpecialChar, '[')) {
+			const node = this.tryParseLink(ctx);
+			if (node) return node;
+		}
+
+		// #channel — # is SpecialChar, followed by Plain
+		if (this.stream.checkImage(SpecialChar, '#')) {
+			const node = this.tryParseChannelMention();
+			if (node) return node;
+		}
+
+		// Plain token — may contain @mentions, emails, URLs, phones, emoji
 		if (this.stream.check(PlainToken)) return this.parsePlainToken();
 
-		// Fallback — SpecialChar, LiteralBackslash, etc → plain text
 		return this.parseFallback();
 	}
 
 	// ===========================================================================
-	// INLINE RULES
+	// #CHANNEL MENTION — # is SpecialChar, rest is in Plain token
 	// ===========================================================================
 
-	// ── Escape ──────────────────────────────────────────────────────────────────
-	private parseEscape(): Inlines {
-		return plain(this.stream.consume().image[1]);
-	}
+	private tryParseChannelMention(): Inlines | null {
+		const savedPos = this.stream.getPos();
+		this.stream.consume(); // #
 
-	// ── Plain Token ─────────────────────────────────────────────────────────────
-	// Scans the token image for email and phone patterns.
-	// Greedily merges consecutive Plain tokens and underscore SpecialChars so
-	// that email addresses like joe_roe@joe.com are seen whole by EMAIL_RE.
-	private parsePlainToken(): Inlines {
-		let text = this.stream.consume().image;
-
-		// Merge trailing _ and the Plain token after it (for joe_roe@joe.com)
-		while (this.stream.checkImage(SpecialChar, '_') && this.stream.peekAt(1)?.tokenType.name === PlainToken.name) {
-			text += this.stream.consume().image; // underscore
-			text += this.stream.consume().image; // following plain
+		const tok = this.stream.peek();
+		if (tok?.tokenType.name === PlainToken.name && !/^\s/.test(tok.image)) {
+			this.stream.consume();
+			// Extract just the channel name (stop at first space)
+			const name = tok.image.split(' ')[0];
+			const rest = tok.image.slice(name.length);
+			if (rest) this.pending.push(plain(rest));
+			return mentionChannel(name);
 		}
 
-		const nodes = this.splitPlainText(text);
-		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
-		return nodes[0];
+		this.stream.setPos(savedPos);
+		return null;
 	}
 
-	// Split a plain text string at email and phone boundaries
-	private splitPlainText(text: string): Inlines[] {
-		const results: Inlines[] = [];
-		let remaining = text;
-		let prevChar = ''; // track char before current slice for phone validation
+	// ===========================================================================
+	// FORMATTING: Bold (*) and Strike (~)
+	// ===========================================================================
 
-		while (remaining.length > 0) {
-			const emailMatch = remaining.match(EMAIL_RE);
-			const phoneMatch = remaining.match(PHONE_RE);
-
-			let emailIdx = emailMatch?.index ?? Infinity;
-			let phoneIdx = phoneMatch?.index ?? Infinity;
-
-			// Phone: reject if the character immediately before + is a word char
-			if (phoneMatch && phoneIdx !== Infinity) {
-				const charBefore = phoneIdx > 0 ? remaining[phoneIdx - 1] : prevChar;
-				if (/\w/.test(charBefore)) phoneIdx = Infinity;
-			}
-
-			// No match — rest is plain text
-			if (emailIdx === Infinity && phoneIdx === Infinity) {
-				results.push(plain(remaining));
-				break;
-			}
-
-			// Pick earliest match
-			const useEmail = emailIdx <= phoneIdx;
-			const matchIdx = useEmail ? emailIdx : phoneIdx;
-			const matchStr = useEmail ? emailMatch![0] : phoneMatch![0];
-
-			// Text before the match
-			if (matchIdx > 0) results.push(plain(remaining.slice(0, matchIdx)));
-
-			// The matched email or phone
-			if (useEmail) {
-				const address = matchStr.startsWith('mailto:') ? matchStr.slice(7) : matchStr;
-				results.push(autoEmail(address));
-			} else {
-				results.push(phoneChecker(matchStr, matchStr.replace(/\D/g, '')));
-			}
-
-			prevChar = matchStr[matchStr.length - 1];
-			remaining = remaining.slice(matchIdx + matchStr.length);
-		}
-
-		return results;
-	}
-
-	// ── Link ────────────────────────────────────────────────────────────────────
-	// Parses [label](url) with backtracking.
-	private tryParseLink(): Inlines | null {
+	private tryParseFormatting(delim: '*' | '~', ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		this.stream.consume(); // opening [
+		this.stream.consume(); // first delim
+		const isDouble = this.stream.checkImage(SpecialChar, delim);
+		if (isDouble) this.stream.consume();
 
-		const labelNodes = this.parseLinkLabel();
+		const innerCtx: FormattingContext = {
+			...ctx,
+			inBold: delim === '*' ? true : ctx.inBold,
+			inStrike: delim === '~' ? true : ctx.inStrike,
+		};
+
+		const inner: Inlines[] = [];
+		let closed = false;
+
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
+
+			if (this.stream.checkImage(SpecialChar, delim)) {
+				const p = this.stream.getPos();
+				this.stream.consume();
+				const closingDouble = this.stream.checkImage(SpecialChar, delim);
+
+				if (isDouble && closingDouble) {
+					this.stream.consume();
+					closed = true;
+					break;
+				} else if (isDouble && !closingDouble) {
+					// Opened ** but only one closing → emit plain opener, reparse as single
+					this.stream.setPos(savedPos + 1);
+					const single = this.tryParseFormatting(delim, ctx);
+					if (single) {
+						this.pending.unshift(single);
+						return plain(delim);
+					}
+					this.stream.setPos(savedPos);
+					return null;
+				} else if (!isDouble && closingDouble) {
+					closed = true;
+					break; // leave extra * in stream
+				} else {
+					closed = true;
+					break;
+				}
+			}
+
+			const node = this.nextInline(innerCtx);
+			if (node) inner.push(node);
+		}
+
+		if (!closed || inner.length === 0) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		const allWS = inner.every((n) => n.type === 'PLAIN_TEXT' && (n as any).value.trim() === '');
+		if (allWS) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		const reduced = reducePlainTexts(inner) as any;
+		return delim === '*' ? bold(reduced) : strike(reduced);
+	}
+
+	// ===========================================================================
+	// ITALIC (_) — word boundary rules
+	// ===========================================================================
+
+	private tryParseItalic(ctx: FormattingContext): Inlines | null {
+		const savedPos = this.stream.getPos();
+
+		// Reject if preceded by word char (mid-word _ not italic)
+		const prevChar = savedPos > 0 ? this.stream.tokenAt(savedPos - 1)?.image?.slice(-1) : undefined;
+		if (isWordChar(prevChar)) return null;
+
+		this.stream.consume(); // first _
+		const isDouble = this.stream.checkImage(SpecialChar, '_');
+		if (isDouble) this.stream.consume();
+
+		const innerCtx: FormattingContext = { ...ctx, inItalic: true };
+		const inner: Inlines[] = [];
+		let closed = false;
+
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
+
+			if (this.stream.checkImage(SpecialChar, '_')) {
+				const p = this.stream.getPos();
+				this.stream.consume();
+				const closingDouble = this.stream.checkImage(SpecialChar, '_');
+				const nextChar = this.stream.peek()?.image?.[0];
+
+				if (isDouble && closingDouble) {
+					if (isWordChar(nextChar)) {
+						this.stream.setPos(p);
+						const node = this.nextInline(innerCtx);
+						if (node) inner.push(node);
+						continue;
+					}
+					this.stream.consume();
+					closed = true;
+					break;
+				} else if (isDouble && !closingDouble) {
+					if (isWordChar(nextChar)) {
+						this.stream.setPos(p);
+						const node = this.nextInline(innerCtx);
+						if (node) inner.push(node);
+						continue;
+					}
+					// Emit plain opener, reparse as single
+					this.stream.setPos(savedPos + 1);
+					const single = this.tryParseItalic(ctx);
+					if (single) {
+						this.pending.unshift(single);
+						return plain('_');
+					}
+					this.stream.setPos(savedPos);
+					return null;
+				} else if (!isDouble && closingDouble) {
+					if (isWordChar(nextChar)) {
+						this.stream.setPos(p);
+						this.stream.setPos(savedPos);
+						return null;
+					}
+					closed = true;
+					break;
+				} else {
+					if (isWordChar(nextChar)) {
+						this.stream.setPos(p);
+						this.stream.setPos(savedPos);
+						return null;
+					}
+					closed = true;
+					break;
+				}
+			}
+
+			const node = this.nextInline(innerCtx);
+			if (node) inner.push(node);
+		}
+
+		if (!closed || inner.length === 0) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+		return italic(reducePlainTexts(inner) as any);
+	}
+
+	// ===========================================================================
+	// LINK [label](url)
+	// ===========================================================================
+
+	private tryParseLink(ctx: FormattingContext): Inlines | null {
+		const savedPos = this.stream.getPos();
+		this.stream.consume(); // [
+
+		const labelNodes = this.parseLinkLabel(ctx);
 
 		if (!this.stream.matchImage(SpecialChar, ']')) {
 			this.stream.setPos(savedPos);
@@ -263,36 +460,23 @@ class Parser {
 		return this.resolveLinkUrl(urlRaw, labelNodes);
 	}
 
-	private parseLinkLabel(): Inlines[] {
+	private parseLinkLabel(ctx: FormattingContext): Inlines[] {
 		const nodes: Inlines[] = [];
-
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.checkImage(SpecialChar, ']')) break;
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-
-			if (this.stream.checkImage(SpecialChar, '*')) {
-				const b = this.tryParseBold();
-				if (b) {
-					nodes.push(b);
-					continue;
-				}
-			}
-
-			nodes.push(this.parseFallback());
+			const node = this.parseInline(ctx);
+			if (node) nodes.push(node);
 		}
-
 		return nodes;
 	}
 
 	private parseLinkUrl(): string | null {
 		const tok = this.stream.peek();
 		if (!tok?.image.startsWith('(')) return null;
-
 		this.stream.consume();
 		let raw = tok.image.slice(1);
-
 		if (raw.endsWith(')')) return raw.slice(0, -1);
-
 		while (!this.stream.isAtEnd()) {
 			const t = this.stream.consume();
 			if (t.image.endsWith(')')) {
@@ -301,52 +485,206 @@ class Parser {
 			}
 			raw += t.image;
 		}
-
 		return null;
 	}
 
 	private resolveLinkUrl(urlRaw: string, labelNodes: Inlines[]): Inlines {
-		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes) as Markup[]) : [plain(urlRaw)];
+		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes) as Markup[]) : undefined;
 
 		if (/^\+(\(\d+\)[\d-]*|\d[\d-]*)$/.test(urlRaw)) {
 			const digits = urlRaw.replace(/\D/g, '');
-			if (digits.length >= 5) return link(`tel:${digits}`, label);
+			if (digits.length >= 5) return link(`tel:${digits}`, label ?? [plain(urlRaw)]);
 		}
-
 		return link(urlRaw, label);
 	}
 
-	// ── Bold (minimal — for inside link labels) ──────────────────────────────────
-	private tryParseBold(): Inlines | null {
-		const savedPos = this.stream.getPos();
+	// ===========================================================================
+	// PLAIN TOKEN — merge underscores, then split at all pattern boundaries
+	// ===========================================================================
 
-		if (!this.stream.matchImage(SpecialChar, '*')) return null;
-		if (!this.stream.matchImage(SpecialChar, '*')) {
-			this.stream.setPos(savedPos);
-			return null;
+	private parsePlainToken(): Inlines {
+		let text = this.stream.consume().image;
+
+		// Merge _ + Plain tokens for emails like joe_roe@joe.com
+		while (this.stream.checkImage(SpecialChar, '_') && this.stream.peekAt(1)?.tokenType.name === PlainToken.name) {
+			text += this.stream.consume().image;
+			text += this.stream.consume().image;
 		}
 
-		const inner: Inlines[] = [];
-		while (!this.stream.isAtEnd()) {
-			if (this.stream.checkImage(SpecialChar, '*')) {
-				const p = this.stream.getPos();
-				this.stream.consume();
-				if (this.stream.matchImage(SpecialChar, '*')) {
-					return bold(reducePlainTexts(inner) as any);
+		const nodes = this.splitPlainText(text);
+		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
+		return nodes[0];
+	}
+
+	// Split plain text at all inline pattern boundaries
+	private splitPlainText(text: string): Inlines[] {
+		const results: Inlines[] = [];
+		let remaining = text;
+		let prevChar = '';
+
+		while (remaining.length > 0) {
+			// Find all candidates
+			const urlMatch = remaining.match(URL_RE);
+			const emailMatch = remaining.match(EMAIL_RE);
+			const phoneMatch = remaining.match(PHONE_RE);
+			const mentionMatch = remaining.match(MENTION_USER_RE);
+
+			let urlIdx = urlMatch?.index ?? Infinity;
+			let emailIdx = emailMatch?.index ?? Infinity;
+			let phoneIdx = phoneMatch?.index ?? Infinity;
+			let mentionIdx = mentionMatch?.index ?? Infinity;
+
+			// URL: reject if preceded by alphanumeric or dot
+			if (urlMatch && urlIdx !== Infinity) {
+				const cb = urlIdx > 0 ? remaining[urlIdx - 1] : prevChar;
+				if (/[a-zA-Z0-9.]/.test(cb)) urlIdx = Infinity;
+			}
+
+			// Phone: reject if preceded by word char
+			if (phoneMatch && phoneIdx !== Infinity) {
+				const cb = phoneIdx > 0 ? remaining[phoneIdx - 1] : prevChar;
+				if (/\w/.test(cb)) phoneIdx = Infinity;
+			}
+
+			// Emoji shortcode
+			let emojiIdx = Infinity;
+			let emojiMatch: RegExpMatchArray | null = null;
+			const emojiRe = /:[a-zA-Z0-9_+\-]+:/g;
+			let em: RegExpMatchArray | null;
+			while ((em = emojiRe.exec(remaining)) !== null) {
+				const before = em.index! > 0 ? remaining[em.index! - 1] : prevChar;
+				const after = remaining[em.index! + em[0].length];
+				if ((em.index === 0 || /[\s:]/.test(before)) && (after === undefined || /[\s:]/.test(after))) {
+					emojiIdx = em.index!;
+					emojiMatch = em;
+					break;
 				}
-				this.stream.setPos(p);
+			}
+
+			// Unicode emoji
+			let unicodeIdx = Infinity;
+			let unicodeMatch: RegExpMatchArray | null = null;
+			const um = remaining.match(UNICODE_EMOJI_RE);
+			if (um?.index !== undefined) {
+				unicodeIdx = um.index;
+				unicodeMatch = um;
+			}
+
+			// Emoticons (only when enabled)
+			let emoticonIdx = Infinity;
+			let emoticonKey = '';
+			if (this.options.emoticons) {
+				for (const key of EMOTICON_LIST) {
+					const idx = remaining.indexOf(key);
+					if (idx === -1) continue;
+					const before = idx > 0 ? remaining[idx - 1] : prevChar;
+					const after = remaining[idx + key.length];
+					// Must be space/start before AND (space/end OR another emoticon start) after
+					const validBefore = idx === 0 ? prevChar === '' || /\s/.test(prevChar) : /\s/.test(before);
+					const validAfter = after === undefined || /\s/.test(after) || this.startsEmoticon(after + remaining.slice(idx + key.length + 1));
+					if (validBefore && validAfter) {
+						if (idx < emoticonIdx) {
+							emoticonIdx = idx;
+							emoticonKey = key;
+						}
+					}
+				}
+			}
+
+			// No matches
+			if ([urlIdx, emailIdx, phoneIdx, mentionIdx, emojiIdx, unicodeIdx, emoticonIdx].every((i) => i === Infinity)) {
+				results.push(plain(remaining));
 				break;
 			}
-			inner.push(this.parseFallback());
+
+			// Pick earliest
+			const minIdx = Math.min(urlIdx, emailIdx, phoneIdx, mentionIdx, emojiIdx, unicodeIdx, emoticonIdx);
+
+			if (minIdx > 0) results.push(plain(remaining.slice(0, minIdx)));
+
+			if (minIdx === urlIdx) {
+				const [stripped, leftover] = stripUrlTrailing(urlMatch![0]);
+				results.push(autoLink(stripped, this.options.customDomains));
+				remaining = leftover + remaining.slice(urlIdx + urlMatch![0].length);
+				prevChar = stripped.slice(-1);
+			} else if (minIdx === emailIdx) {
+				const address = emailMatch![0].startsWith('mailto:') ? emailMatch![0].slice(7) : emailMatch![0];
+				results.push(autoEmail(address));
+				prevChar = emailMatch![0].slice(-1);
+				remaining = remaining.slice(emailIdx + emailMatch![0].length);
+			} else if (minIdx === phoneIdx) {
+				results.push(phoneChecker(phoneMatch![0], phoneMatch![0].replace(/\D/g, '')));
+				prevChar = phoneMatch![0].slice(-1);
+				remaining = remaining.slice(phoneIdx + phoneMatch![0].length);
+			} else if (minIdx === mentionIdx) {
+				results.push(mentionUser(mentionMatch![0].slice(1))); // strip @
+				prevChar = mentionMatch![0].slice(-1);
+				remaining = remaining.slice(mentionIdx + mentionMatch![0].length);
+			} else if (minIdx === emojiIdx) {
+				results.push(emoji(emojiMatch![0].slice(1, -1)));
+				prevChar = ':';
+				remaining = remaining.slice(emojiIdx + emojiMatch![0].length);
+			} else if (minIdx === unicodeIdx) {
+				results.push(emojiUnicode(unicodeMatch![0]));
+				prevChar = unicodeMatch![0].slice(-1);
+				remaining = remaining.slice(unicodeIdx + unicodeMatch![0].length);
+			} else {
+				// Emoticon
+				results.push(emoticonNode(emoticonKey, EMOTICONS[emoticonKey]));
+				prevChar = emoticonKey.slice(-1);
+				remaining = remaining.slice(emoticonIdx + emoticonKey.length);
+			}
+		}
+
+		return results;
+	}
+
+	// Check if a string starts with a known emoticon
+	private startsEmoticon(s: string): boolean {
+		return EMOTICON_LIST.some((k: any) => s.startsWith(k));
+	}
+
+	// ===========================================================================
+	// ESCAPE & FALLBACK
+	// ===========================================================================
+
+	private parseEscape(): Inlines {
+		return plain(this.stream.consume().image[1]);
+	}
+
+	private parseFallback(): Inlines {
+		return plain(this.stream.consume().image);
+	}
+
+	// ===========================================================================
+	// INLINE CODE
+	// ===========================================================================
+
+	private tryParseInlineCode(): Inlines | null {
+		const savedPos = this.stream.getPos();
+		this.stream.consume(); // opening `
+
+		const parts: string[] = [];
+
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
+
+			if (this.stream.checkImage(SpecialChar, '`')) {
+				this.stream.consume(); // closing `
+
+				if (parts.length === 0) {
+					this.stream.setPos(savedPos);
+					return null;
+				}
+
+				return inlineCode(plain(parts.join('')));
+			}
+
+			parts.push(this.stream.consume().image);
 		}
 
 		this.stream.setPos(savedPos);
 		return null;
-	}
-
-	// ── Fallback ────────────────────────────────────────────────────────────────
-	private parseFallback(): Inlines {
-		return plain(this.stream.consume().image);
 	}
 }
 
