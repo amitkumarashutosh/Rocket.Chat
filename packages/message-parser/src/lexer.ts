@@ -1,4 +1,5 @@
 import { createToken, Lexer } from 'chevrotain';
+import { EMAIL_PATTERN, URL_PATTERN, PHONE_PATTERN } from './patterns';
 
 // =============================================================================
 // TOKEN TYPES
@@ -7,64 +8,72 @@ import { createToken, Lexer } from 'chevrotain';
 // =============================================================================
 
 // ─── Escape ───────────────────────────────────────────────────────────────────
-// Backslash followed by an escapable char: * _ ~ ` # .
-// \[ is intentionally excluded — it stays as literal \[
 export const Escape = createToken({
 	name: 'Escape',
 	pattern: /\\[*_~`#.]/,
 });
 
 // ─── Literal Backslash ────────────────────────────────────────────────────────
-// Backslash NOT followed by an escapable char (e.g. \[ \& \<).
-// Kept as-is including the backslash. MUST come after Escape.
 export const LiteralBackslash = createToken({
 	name: 'LiteralBackslash',
 	pattern: /\\(?![*_~`#.])/,
 });
 
 // ─── Double New Line ──────────────────────────────────────────────────────────
-// Two consecutive newlines — becomes a LINE_BREAK block node.
-// MUST come before NewLine.
 export const DoubleNewLine = createToken({
 	name: 'DoubleNewLine',
 	pattern: /\n\n/,
 });
 
 // ─── New Line ─────────────────────────────────────────────────────────────────
-// Single newline — paragraph terminator.
 export const NewLine = createToken({
 	name: 'NewLine',
 	pattern: /\n/,
 });
 
+// ─── Email ────────────────────────────────────────────────────────────────────
+// MUST come before Url — mailto:foo@bar.com also matches URL_PATTERN.
+export const Email = createToken({
+	name: 'Email',
+	pattern: EMAIL_PATTERN,
+});
+
+// ─── URL ──────────────────────────────────────────────────────────────────────
+export const Url = createToken({
+	name: 'Url',
+	pattern: URL_PATTERN,
+});
+
+// ─── Phone ────────────────────────────────────────────────────────────────────
+export const Phone = createToken({
+	name: 'Phone',
+	pattern: PHONE_PATTERN,
+});
+
 // ─── Plain Text ───────────────────────────────────────────────────────────────
-// Any run of non-special characters.
-// NOTE: emails and phone numbers are detected INSIDE Plain tokens by the parser.
-// This avoids Chevrotain lookbehind issues and handles mid-sentence emails cleanly.
+// @mentions, emoji shortcodes, and emoticons are detected inside Plain tokens
+// by the parser's splitPlainText() — they require surrounding context that
+// stateless Chevrotain tokens cannot express.
 export const Plain = createToken({
 	name: 'Plain',
-	pattern: /[^*_~`#\\\[\]\n]+/,
+	pattern: /[^*_~`#\\\[\]\n+]+/,
 });
 
 // ─── Special Char ─────────────────────────────────────────────────────────────
-// Single special character not consumed by any other token.
-// These become PLAIN_TEXT if no formatting rule claims them.
 export const SpecialChar = createToken({
 	name: 'SpecialChar',
-	pattern: /[*_~`#\[\]]/,
+	pattern: /[*_~`#\[\]+]/,
 });
 
 // =============================================================================
-// TOKEN ORDER — Chevrotain tries top to bottom at each position
+// TOKEN ORDER
+//   Email    before  Url         — mailto:foo@bar also matches Url
+//   Email    before  Plain       — foo@bar.com would otherwise be plain text
+//   Url      before  Plain       — http://... would otherwise be plain text
+//   Phone    before  Plain       — +123... would otherwise be plain text
+//   Plain    before  SpecialChar — greedily consume before single-char fallback
 // =============================================================================
-export const allTokens = [
-	Escape, // \\*  \\_  etc       — before LiteralBackslash
-	LiteralBackslash, // \\[  \\&  etc        — before SpecialChar
-	DoubleNewLine, // \n\n                 — before NewLine
-	NewLine, // \n
-	Plain, // normal text runs    — before SpecialChar
-	SpecialChar, // * _ ~ ` # [ ]       — catch-all
-];
+export const allTokens = [Escape, LiteralBackslash, DoubleNewLine, NewLine, Email, Url, Phone, Plain, SpecialChar];
 
 export const MessageLexer = new Lexer(allTokens, {
 	positionTracking: 'onlyStart',

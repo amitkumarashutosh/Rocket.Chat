@@ -1,6 +1,17 @@
 import type { IToken } from 'chevrotain';
 
-import { MessageLexer, Escape, LiteralBackslash, DoubleNewLine, NewLine, Plain as PlainToken, SpecialChar } from './lexer';
+import {
+	MessageLexer,
+	Escape,
+	LiteralBackslash,
+	DoubleNewLine,
+	NewLine,
+	Plain as PlainToken,
+	SpecialChar,
+	Email as EmailToken,
+	Url as UrlToken,
+	Phone as PhoneToken,
+} from './lexer';
 
 import {
 	paragraph,
@@ -26,32 +37,7 @@ import {
 import type { Root, Inlines, Markup } from './definitions';
 import type { Options } from './index';
 import { EMOTICONS, EMOTICON_LIST } from './emoticons';
-
-// =============================================================================
-// INLINE PATTERNS — all detected inside Plain tokens via splitPlainText()
-// The lexer does NOT have special tokens for these; they live in Plain text.
-// =============================================================================
-
-// @mention — unicode-aware, includes . @ : - in name
-const MENTION_USER_RE =
-	/@[\w\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF\u0E00-\u0E7F\u0900-\u097F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF][\w\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF\u0E00-\u0E7F\u0900-\u097F\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF.@:-]*/;
-
-// Email
-const EMAIL_RE =
-	/(?:mailto:)?[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF'_.+-]+@[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF-]+\.[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF.-]+[a-zA-Z0-9\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u00FF\u0400-\u04FF]/;
-
-// URL
-const URL_RE = /(?:(?:[a-zA-Z][a-zA-Z0-9+\-]*):\/\/|(?:www\.))[\S]+/;
-
-// Phone
-const PHONE_RE = /\+(\(\d+\)[\d-]*|\d[\d-]*)(?![.,\d])/;
-
-// Emoji shortcode: must be preceded by space/start/colon, followed by space/end/colon
-const EMOJI_CODE_RE = /:[a-zA-Z0-9_+\-]+:/g;
-
-// Unicode emoji sequences
-const UNICODE_EMOJI_RE =
-	/(?:\p{Emoji}\uFE0F|\p{Emoji_Presentation})\p{Emoji_Modifier}?(?:\u200D(?:\p{Emoji}\uFE0F|\p{Emoji_Presentation})\p{Emoji_Modifier}?)*/u;
+import { MENTION_USER_RE, EMOJI_CODE_RE, UNICODE_EMOJI_RE, URL_TRAILING_CHARS, PHONE_URL_RE } from './patterns';
 
 // =============================================================================
 // TOKEN STREAM
@@ -110,7 +96,7 @@ function stripUrlTrailing(url: string): [string, string] {
 	let result = url;
 	while (result.length > 0) {
 		const last = result[result.length - 1];
-		if ('.!,'.includes(last)) result = result.slice(0, -1);
+		if (URL_TRAILING_CHARS.includes(last)) result = result.slice(0, -1);
 		else if (last === ')' && !result.includes('(')) result = result.slice(0, -1);
 		else break;
 	}
@@ -121,9 +107,15 @@ function isWordChar(ch: string | undefined): boolean {
 	return ch !== undefined && /[a-zA-Z0-9]/.test(ch);
 }
 
+// Returns the last character of the token immediately before position pos,
+// looking across all token types (Plain, Email, Url, Phone, SpecialChar…).
+function prevTokenLastChar(stream: TokenStream, pos: number): string | undefined {
+	if (pos === 0) return undefined;
+	return stream.tokenAt(pos - 1)?.image?.slice(-1);
+}
+
 // =============================================================================
 // BIG EMOJI POST-PROCESSOR
-// Check if the entire parsed result is 1-3 emoji/emoticon nodes (+ whitespace only)
 // =============================================================================
 
 function tryMakeBigEmoji(blocks: any[]): Root {
@@ -135,7 +127,7 @@ function tryMakeBigEmoji(blocks: any[]): Root {
 
 		for (const node of block.value) {
 			if (node.type === 'PLAIN_TEXT') {
-				if (node.value.trim() !== '') return blocks; // non-whitespace text = not bigEmoji
+				if (node.value.trim() !== '') return blocks;
 			} else if (node.type === 'EMOJI') {
 				emojis.push(node);
 			} else {
@@ -254,10 +246,63 @@ class Parser {
 			if (node) return node;
 		}
 
-		// Plain token — may contain @mentions, emails, URLs, phones, emoji
+		// ── Tokens moved from splitPlainText ──────────────────────────────────
+
+		// Email token — foo@bar.com or mailto:foo@bar.com
+		if (this.stream.check(EmailToken)) return this.parseEmailToken();
+
+		// URL token — http://... or www....
+		if (this.stream.check(UrlToken)) return this.parseUrlToken();
+
+		// Phone token — +44...
+		if (this.stream.check(PhoneToken)) return this.parsePhoneToken();
+
+		// Plain token — may still contain @mentions, emoji shortcodes and emoticons
 		if (this.stream.check(PlainToken)) return this.parsePlainToken();
 
 		return this.parseFallback();
+	}
+
+	// ===========================================================================
+	// EMAIL TOKEN
+	// ===========================================================================
+
+	private parseEmailToken(): Inlines {
+		const tok = this.stream.consume();
+		const address = tok.image.startsWith('mailto:') ? tok.image.slice(7) : tok.image;
+		return autoEmail(address);
+	}
+
+	// ===========================================================================
+	// URL TOKEN
+	// ===========================================================================
+
+	private parseUrlToken(): Inlines {
+		const tok = this.stream.consume();
+
+		// Check if preceded by alphanumeric/dot — same guard as old splitPlainText
+		const prevChar = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
+		if (/[a-zA-Z0-9.]/.test(prevChar ?? '')) {
+			return plain(tok.image);
+		}
+
+		const [stripped, leftover] = stripUrlTrailing(tok.image);
+		if (leftover) this.pending.push(plain(leftover));
+		return autoLink(stripped, this.options.customDomains);
+	}
+
+	// ===========================================================================
+	// PHONE TOKEN
+	// ===========================================================================
+
+	private parsePhoneToken(): Inlines {
+		const tok = this.stream.consume();
+
+		// Reject if preceded by a word char
+		const prevChar = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
+		if (/\w/.test(prevChar ?? '')) return plain(tok.image);
+
+		return phoneChecker(tok.image, tok.image.replace(/\D/g, ''));
 	}
 
 	// ===========================================================================
@@ -271,7 +316,6 @@ class Parser {
 		const tok = this.stream.peek();
 		if (tok?.tokenType.name === PlainToken.name && !/^\s/.test(tok.image)) {
 			this.stream.consume();
-			// Extract just the channel name (stop at first space)
 			const name = tok.image.split(' ')[0];
 			const rest = tok.image.slice(name.length);
 			if (rest) this.pending.push(plain(rest));
@@ -326,7 +370,7 @@ class Parser {
 					return null;
 				} else if (!isDouble && closingDouble) {
 					closed = true;
-					break; // leave extra * in stream
+					break; // leave extra delim in stream
 				} else {
 					closed = true;
 					break;
@@ -360,8 +404,7 @@ class Parser {
 		const savedPos = this.stream.getPos();
 
 		// Reject if preceded by word char (mid-word _ not italic)
-		const prevChar = savedPos > 0 ? this.stream.tokenAt(savedPos - 1)?.image?.slice(-1) : undefined;
-
+		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar)) return null;
 
 		this.stream.consume(); // first _
@@ -409,7 +452,6 @@ class Parser {
 					return null;
 				} else if (!isDouble && closingDouble) {
 					if (isWordChar(nextChar)) {
-						this.stream.setPos(p);
 						this.stream.setPos(savedPos);
 						return null;
 					}
@@ -417,7 +459,6 @@ class Parser {
 					break;
 				} else {
 					if (isWordChar(nextChar)) {
-						this.stream.setPos(p);
 						this.stream.setPos(savedPos);
 						return null;
 					}
@@ -499,7 +540,7 @@ class Parser {
 	private resolveLinkUrl(urlRaw: string, labelNodes: Inlines[]): Inlines {
 		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes) as Markup[]) : undefined;
 
-		if (/^\+(\(\d+\)[\d-]*|\d[\d-]*)$/.test(urlRaw)) {
+		if (PHONE_URL_RE.test(urlRaw)) {
 			const digits = urlRaw.replace(/\D/g, '');
 			if (digits.length >= 5) return link(`tel:${digits}`, label ?? [plain(urlRaw)]);
 		}
@@ -507,23 +548,29 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// PLAIN TOKEN — merge underscores, then split at all pattern boundaries
+	// PLAIN TOKEN — now only handles emoji shortcodes and emoticons.
+	// Email, URL, Phone are handled as dedicated lexer tokens above.
+	//
+	// Underscore merging: still needed for word-internal cases like joe_roe@joe.com.
+	// Now also merges when _ is followed by Email (e.g. local_part@domain.com).
 	// ===========================================================================
 
 	private parsePlainToken(): Inlines {
 		let text = this.stream.consume().image;
 
-		// Merge _ + Plain tokens for word-internal cases like joe_roe@joe.com
-		// but NOT when the Plain after _ starts with a space (that _ could be a closing italic)
+		// Merge _ + Plain/Email tokens for word-internal cases like joe_roe@joe.com
 		while (
 			this.stream.checkImage(SpecialChar, '_') &&
-			this.stream.peekAt(1)?.tokenType.name === PlainToken.name &&
-			!/^\s/.test(this.stream.peekAt(1)!.image) &&
-			!/^_/.test(this.stream.peekAt(1)!.image) &&
+			// _ followed by Plain that doesn't start with space or _
+			((this.stream.peekAt(1)?.tokenType.name === PlainToken.name &&
+				!/^\s/.test(this.stream.peekAt(1)!.image) &&
+				!/^_/.test(this.stream.peekAt(1)!.image)) ||
+				// _ followed by Email (e.g. local_part@domain.com)
+				this.stream.peekAt(1)?.tokenType.name === EmailToken.name) &&
 			/[a-zA-Z0-9]/.test(text.slice(-1))
 		) {
-			text += this.stream.consume().image;
-			text += this.stream.consume().image;
+			text += this.stream.consume().image; // _
+			text += this.stream.consume().image; // Plain or Email
 		}
 
 		const nodes = this.splitPlainText(text);
@@ -531,46 +578,29 @@ class Parser {
 		return nodes[0];
 	}
 
-	// Split plain text at all inline pattern boundaries
+	// Split plain text at @mention, emoji shortcode, and emoticon boundaries.
+	// URL/email/phone are now handled as dedicated lexer tokens.
+	// @mention stays here due to word-boundary context requirement.
 	private splitPlainText(text: string): Inlines[] {
 		const results: Inlines[] = [];
 		let remaining = text;
 		let prevChar = '';
 
 		while (remaining.length > 0) {
-			// Find all candidates
-			const urlMatch = remaining.match(URL_RE);
-			const emailMatch = remaining.match(EMAIL_RE);
-			const phoneMatch = remaining.match(PHONE_RE);
+			// @mention
 			const mentionMatch = remaining.match(MENTION_USER_RE);
-
-			let urlIdx = urlMatch?.index ?? Infinity;
-			let emailIdx = emailMatch?.index ?? Infinity;
-			let phoneIdx = phoneMatch?.index ?? Infinity;
 			let mentionIdx = mentionMatch?.index ?? Infinity;
 
-			// Mention: reject if preceded by word char (e.g. italic@test should not match @test)
+			// Reject if preceded by word char
 			if (mentionMatch && mentionIdx !== Infinity) {
 				const cb = mentionIdx > 0 ? remaining[mentionIdx - 1] : prevChar;
 				if (/[a-zA-Z0-9]/.test(cb)) mentionIdx = Infinity;
 			}
 
-			// URL: reject if preceded by alphanumeric or dot
-			if (urlMatch && urlIdx !== Infinity) {
-				const cb = urlIdx > 0 ? remaining[urlIdx - 1] : prevChar;
-				if (/[a-zA-Z0-9.]/.test(cb)) urlIdx = Infinity;
-			}
-
-			// Phone: reject if preceded by word char
-			if (phoneMatch && phoneIdx !== Infinity) {
-				const cb = phoneIdx > 0 ? remaining[phoneIdx - 1] : prevChar;
-				if (/\w/.test(cb)) phoneIdx = Infinity;
-			}
-
 			// Emoji shortcode
 			let emojiIdx = Infinity;
 			let emojiMatch: RegExpMatchArray | null = null;
-			const emojiRe = /:[a-zA-Z0-9_+\-]+:/g;
+			const emojiRe = new RegExp(EMOJI_CODE_RE.source, 'g');
 			let em: RegExpMatchArray | null;
 			while ((em = emojiRe.exec(remaining)) !== null) {
 				const before = em.index! > 0 ? remaining[em.index! - 1] : prevChar;
@@ -600,44 +630,25 @@ class Parser {
 					if (idx === -1) continue;
 					const before = idx > 0 ? remaining[idx - 1] : prevChar;
 					const after = remaining[idx + key.length];
-					// Must be space/start before AND (space/end OR another emoticon start) after
 					const validBefore = idx === 0 ? prevChar === '' || /\s/.test(prevChar) : /\s/.test(before);
 					const validAfter = after === undefined || /\s/.test(after) || this.startsEmoticon(after + remaining.slice(idx + key.length + 1));
-					if (validBefore && validAfter) {
-						if (idx < emoticonIdx) {
-							emoticonIdx = idx;
-							emoticonKey = key;
-						}
+					if (validBefore && validAfter && idx < emoticonIdx) {
+						emoticonIdx = idx;
+						emoticonKey = key;
 					}
 				}
 			}
 
-			// No matches
-			if ([urlIdx, emailIdx, phoneIdx, mentionIdx, emojiIdx, unicodeIdx, emoticonIdx].every((i) => i === Infinity)) {
+			// No matches — entire remaining string is plain text
+			if ([mentionIdx, emojiIdx, unicodeIdx, emoticonIdx].every((i) => i === Infinity)) {
 				results.push(plain(remaining));
 				break;
 			}
 
-			// Pick earliest
-			const minIdx = Math.min(urlIdx, emailIdx, phoneIdx, mentionIdx, emojiIdx, unicodeIdx, emoticonIdx);
-
+			const minIdx = Math.min(mentionIdx, emojiIdx, unicodeIdx, emoticonIdx);
 			if (minIdx > 0) results.push(plain(remaining.slice(0, minIdx)));
 
-			if (minIdx === urlIdx) {
-				const [stripped, leftover] = stripUrlTrailing(urlMatch![0]);
-				results.push(autoLink(stripped, this.options.customDomains));
-				remaining = leftover + remaining.slice(urlIdx + urlMatch![0].length);
-				prevChar = stripped.slice(-1);
-			} else if (minIdx === emailIdx) {
-				const address = emailMatch![0].startsWith('mailto:') ? emailMatch![0].slice(7) : emailMatch![0];
-				results.push(autoEmail(address));
-				prevChar = emailMatch![0].slice(-1);
-				remaining = remaining.slice(emailIdx + emailMatch![0].length);
-			} else if (minIdx === phoneIdx) {
-				results.push(phoneChecker(phoneMatch![0], phoneMatch![0].replace(/\D/g, '')));
-				prevChar = phoneMatch![0].slice(-1);
-				remaining = remaining.slice(phoneIdx + phoneMatch![0].length);
-			} else if (minIdx === mentionIdx) {
+			if (minIdx === mentionIdx) {
 				let mentionText = mentionMatch![0];
 				// Strip trailing underscores — they may be italic delimiters
 				const stripped = mentionText.replace(/_+$/, '');
