@@ -6,6 +6,7 @@ import {
 	LiteralBackslash,
 	DoubleNewLine,
 	NewLine,
+	CodeFence,
 	Plain as PlainToken,
 	SpecialChar,
 	Email as EmailToken,
@@ -32,6 +33,8 @@ import {
 	mentionChannel,
 	bigEmoji,
 	inlineCode,
+	code,
+	codeLine,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -179,11 +182,92 @@ class Parser {
 				continue;
 			}
 
+			// Code block — ``` must be at the very start of a line.
+			// Guard: only attempt if we're at position 0 or the previous token was a newline.
+			if (this.stream.check(CodeFence)) {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+
+				if (pos === 0 || prevIsNewline) {
+					const block = this.tryParseCodeBlock();
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
 			const para = this.parseParagraph();
 			if (para.value.length > 0) blocks.push(para);
 		}
 
 		return tryMakeBigEmoji(blocks);
+	}
+
+	// ===========================================================================
+	// CODE BLOCK
+	// ===========================================================================
+
+	private tryParseCodeBlock(): any | null {
+		const savedPos = this.stream.getPos();
+		const openTok = this.stream.consume(); // consume the ``` token
+
+		// Extract optional language label from the opening fence token image
+		// e.g. "```javascript" → "javascript", "```" → undefined
+		const rawLang = openTok.image.slice(3).trim();
+		const lang = rawLang.length > 0 ? rawLang : undefined;
+
+		// Opening fence must be followed by a newline
+		if (!this.stream.match(NewLine)) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		const lines: any[] = [];
+
+		while (!this.stream.isAtEnd()) {
+			// Closing fence
+			if (this.stream.check(CodeFence)) {
+				this.stream.consume();
+				return code(lines, lang);
+			}
+
+			// Collect raw text for one line until we hit a newline token
+			const lineParts: string[] = [];
+
+			while (!this.stream.isAtEnd()) {
+				if (this.stream.check(CodeFence)) break; // will be caught by outer loop
+
+				if (this.stream.check(NewLine)) {
+					this.stream.consume();
+					break;
+				}
+
+				if (this.stream.check(DoubleNewLine)) {
+					// DoubleNewLine = "\n\n" — push the current line, then a blank line,
+					// then stop collecting (the second \n is already consumed).
+					this.stream.consume();
+					lines.push(codeLine(plain(lineParts.join(''))));
+					lines.push(codeLine(plain('')));
+					lineParts.length = 0;
+					// Signal that we already pushed, skip the push below
+					// by setting a flag via a sentinel
+					(lineParts as any).__alreadyPushed = true;
+					break;
+				}
+
+				lineParts.push(this.stream.consume().image);
+			}
+
+			if (!(lineParts as any).__alreadyPushed) {
+				lines.push(codeLine(plain(lineParts.join(''))));
+			}
+		}
+
+		// No closing fence found — not a valid code block
+		this.stream.setPos(savedPos);
+		return null;
 	}
 
 	private parseParagraph() {
@@ -259,6 +343,9 @@ class Parser {
 
 		// Plain token — may still contain @mentions, emoji shortcodes and emoticons
 		if (this.stream.check(PlainToken)) return this.parsePlainToken();
+
+		// CodeFence inside a paragraph — treat as plain text (e.g. "  ```")
+		if (this.stream.check(CodeFence)) return plain(this.stream.consume().image);
 
 		return this.parseFallback();
 	}

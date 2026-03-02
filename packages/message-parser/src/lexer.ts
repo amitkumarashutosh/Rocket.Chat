@@ -31,6 +31,13 @@ export const NewLine = createToken({
 	pattern: /\n/,
 });
 
+// ─── Code Fence ───────────────────────────────────────────────────────────────
+// Matches ``` with optional language label. MUST come before Plain and SpecialChar.
+export const CodeFence = createToken({
+	name: 'CodeFence',
+	pattern: /```[^\n]*/,
+});
+
 // ─── Email ────────────────────────────────────────────────────────────────────
 // MUST come before Url — mailto:foo@bar.com also matches URL_PATTERN.
 export const Email = createToken({
@@ -67,13 +74,14 @@ export const SpecialChar = createToken({
 
 // =============================================================================
 // TOKEN ORDER
+//   CodeFence before Email/Url/Phone/Plain/SpecialChar — ``` must be caught first
 //   Email    before  Url         — mailto:foo@bar also matches Url
 //   Email    before  Plain       — foo@bar.com would otherwise be plain text
 //   Url      before  Plain       — http://... would otherwise be plain text
 //   Phone    before  Plain       — +123... would otherwise be plain text
 //   Plain    before  SpecialChar — greedily consume before single-char fallback
 // =============================================================================
-export const allTokens = [Escape, LiteralBackslash, DoubleNewLine, NewLine, Email, Url, Phone, Plain, SpecialChar];
+export const allTokens = [Escape, LiteralBackslash, DoubleNewLine, NewLine, CodeFence, Email, Url, Phone, Plain, SpecialChar];
 
 export const MessageLexer = new Lexer(allTokens, {
 	positionTracking: 'onlyStart',
