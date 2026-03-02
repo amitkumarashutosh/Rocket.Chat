@@ -36,6 +36,8 @@ import {
 	code,
 	codeLine,
 	heading,
+	katex,
+	inlineKatex,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -187,6 +189,15 @@ class Parser {
 				continue;
 			}
 
+			// Block KaTeX — \[ ... \] (only when katex.parenthesisSyntax is enabled)
+			if ((this.options as any).katex?.parenthesisSyntax && this.stream.check(LiteralBackslash)) {
+				const block = this.tryParseBlockKatex();
+				if (block) {
+					blocks.push(block);
+					continue;
+				}
+			}
+
 			// Code block — ``` must be at the very start of a line.
 			// Guard: only attempt if we're at position 0 or the previous token was a newline.
 			if (this.stream.check(CodeFence)) {
@@ -326,6 +337,81 @@ class Parser {
 		return heading([plain(parts.join(''))], level as 1 | 2 | 3 | 4);
 	}
 
+	// ===========================================================================
+	// BLOCK KATEX — \[ ... \]
+	// ===========================================================================
+
+	private tryParseBlockKatex(): any | null {
+		const savedPos = this.stream.getPos();
+
+		if (!this.stream.check(LiteralBackslash)) return null;
+		this.stream.consume(); // \
+
+		if (!this.stream.checkImage(SpecialChar, '[')) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+		this.stream.consume(); // [
+
+		const parts: string[] = [];
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(LiteralBackslash)) {
+				this.stream.consume(); // \
+				if (this.stream.checkImage(SpecialChar, ']')) {
+					this.stream.consume(); // ]
+					return katex(parts.join(''));
+				}
+				parts.push('\\');
+				continue;
+			}
+			parts.push(this.stream.consume().image);
+		}
+
+		this.stream.setPos(savedPos);
+		return null;
+	}
+
+	// ===========================================================================
+	// INLINE KATEX — \(content\)
+	// ===========================================================================
+
+	private tryParseInlineKatex(): Inlines | null {
+		const savedPos = this.stream.getPos();
+
+		this.stream.consume(); // \
+
+		// Next token must be a Plain token starting with (
+		const next = this.stream.peek();
+		if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith('(')) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+		this.stream.consume();
+		const afterParen = next.image.slice(1); // strip leading (
+
+		// Collect until \)
+		const parts: string[] = [afterParen];
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(NewLine) || this.stream.check(DoubleNewLine)) break;
+			if (this.stream.check(LiteralBackslash)) {
+				this.stream.consume(); // \
+				const t = this.stream.peek();
+				if (t && t.tokenType.name === PlainToken.name && t.image.startsWith(')')) {
+					this.stream.consume();
+					const leftover = t.image.slice(1);
+					if (leftover) this.pending.push(plain(leftover));
+					return inlineKatex(parts.join(''));
+				}
+				parts.push('\\\\');
+				continue;
+			}
+			parts.push(this.stream.consume().image);
+		}
+
+		this.stream.setPos(savedPos);
+		return null;
+	}
+
 	private parseParagraph() {
 		const inlines: Inlines[] = [];
 
@@ -349,6 +435,12 @@ class Parser {
 
 	private parseInline(ctx: FormattingContext): Inlines | null {
 		if (this.stream.check(Escape)) return this.parseEscape();
+
+		// Inline KaTeX — \(content\)
+		if ((this.options as any).katex?.parenthesisSyntax && this.stream.check(LiteralBackslash)) {
+			const node = this.tryParseInlineKatex();
+			if (node) return node;
+		}
 
 		// Bold *
 		if (this.stream.checkImage(SpecialChar, '*') && !ctx.inBold) {
