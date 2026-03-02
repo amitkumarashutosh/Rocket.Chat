@@ -35,6 +35,7 @@ import {
 	inlineCode,
 	code,
 	codeLine,
+	heading,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -176,8 +177,12 @@ class Parser {
 				while (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) {
 					count += this.stream.consume().image.length;
 				}
-				if (blocks.length > 0 && !this.stream.isAtEnd()) {
-					for (let i = 0; i < count - 1; i++) blocks.push(lineBreak());
+				if (blocks.length > 0) {
+					// A trailing \n after a heading counts as one lineBreak;
+					// between paragraphs each extra \n beyond the first is a lineBreak.
+					const lastIsHeading = blocks[blocks.length - 1]?.type === 'HEADING';
+					const breaksToAdd = lastIsHeading ? count - 1 + (this.stream.isAtEnd() ? 1 : 0) : this.stream.isAtEnd() ? 0 : count - 1;
+					for (let i = 0; i < breaksToAdd; i++) blocks.push(lineBreak());
 				}
 				continue;
 			}
@@ -191,6 +196,21 @@ class Parser {
 
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseCodeBlock();
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
+			// Heading — # / ## / ### / #### followed by a space, only at line start.
+			if (this.stream.checkImage(SpecialChar, '#')) {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+
+				if (pos === 0 || prevIsNewline) {
+					const block = this.tryParseHeading();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -268,6 +288,42 @@ class Parser {
 		// No closing fence found — not a valid code block
 		this.stream.setPos(savedPos);
 		return null;
+	}
+
+	// ===========================================================================
+	// HEADING
+	// ===========================================================================
+
+	private tryParseHeading(): any | null {
+		const savedPos = this.stream.getPos();
+
+		// Count consecutive # SpecialChars (max 4)
+		let level = 0;
+		while (this.stream.checkImage(SpecialChar, '#') && level < 4) {
+			this.stream.consume();
+			level++;
+		}
+
+		// Must be followed by a Plain token starting with a space
+		const next = this.stream.peek();
+		if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith(' ')) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		const tok = this.stream.consume();
+		const text = tok.image.slice(1); // strip leading space
+
+		// Collect any remaining tokens on this line (do NOT consume the newline)
+		const parts: string[] = [text];
+		while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
+			parts.push(this.stream.consume().image);
+		}
+
+		// Emit the trailing newline back so parseMessage can count it for lineBreak
+		// We intentionally leave it in the stream — parseMessage's newline loop handles it.
+
+		return heading([plain(parts.join(''))], level as 1 | 2 | 3 | 4);
 	}
 
 	private parseParagraph() {
@@ -398,7 +454,22 @@ class Parser {
 
 	private tryParseChannelMention(): Inlines | null {
 		const savedPos = this.stream.getPos();
+
+		// Reject if preceded by a word char (mid-word # is not a mention)
+		const prevChar = prevTokenLastChar(this.stream, savedPos);
+		if (isWordChar(prevChar)) return null;
+
+		// Reject if preceded by another # (handles ##Hello case where first # was
+		// emitted as plain and now we're at the second #)
+		if (prevChar === '#') return null;
+
 		this.stream.consume(); // #
+
+		// Reject if the next token is also # (e.g. still inside ##Hello at pos 0)
+		if (this.stream.checkImage(SpecialChar, '#')) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
 
 		const tok = this.stream.peek();
 		if (tok?.tokenType.name === PlainToken.name && !/^\s/.test(tok.image)) {
