@@ -38,6 +38,7 @@ import {
 	heading,
 	katex,
 	inlineKatex,
+	quote,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -207,6 +208,20 @@ class Parser {
 
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseCodeBlock();
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
+			// Blockquote — > or >text lines, only at line start.
+			if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('>')) {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+				if (pos === 0 || prevIsNewline) {
+					const block = this.tryParseQuote();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -410,6 +425,66 @@ class Parser {
 
 		this.stream.setPos(savedPos);
 		return null;
+	}
+
+	// ===========================================================================
+	// BLOCKQUOTE — consecutive > lines
+	// ===========================================================================
+
+	private tryParseQuote(): any | null {
+		const savedPos = this.stream.getPos();
+		const paragraphs: any[] = [];
+
+		while (!this.stream.isAtEnd()) {
+			// Check we have a Plain token starting with >
+			if (!this.stream.check(PlainToken) || !this.stream.peek()!.image.startsWith('>')) break;
+
+			const tok = this.stream.consume();
+			// Strip the leading > and optional single space
+			let line = tok.image.slice(1);
+			if (line.startsWith(' ')) line = line.slice(1);
+
+			// Collect any remaining tokens on this line (e.g. Email, Url, SpecialChar tokens)
+			const lineParts: string[] = [line];
+			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
+				lineParts.push(this.stream.consume().image);
+			}
+			const lineText = lineParts.join('');
+
+			// Re-parse the line content using a sub-parser
+			const lineInlines = this.parseQuoteLine(lineText);
+			paragraphs.push(paragraph(reducePlainTexts(lineInlines)));
+
+			// Consume the newline separator between quote lines
+			if (this.stream.check(NewLine)) {
+				this.stream.consume();
+			} else if (this.stream.check(DoubleNewLine)) {
+				break;
+			} else {
+				break;
+			}
+		}
+
+		if (paragraphs.length === 0) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		return quote(paragraphs);
+	}
+
+	// Parse a single quote line's text as inlines by re-lexing and re-parsing it.
+	private parseQuoteLine(text: string): Inlines[] {
+		const { tokens, errors } = MessageLexer.tokenize(text);
+		if (errors.length > 0) return [plain(text)];
+		const subStream = new TokenStream(tokens);
+		const subParser = new Parser(subStream, this.options);
+		const result = subParser.parseMessage();
+		// result is Root = Array<Paragraph|Blocks> — extract inlines from first paragraph
+		if (result.length === 0) return [plain('')];
+		const first = result[0] as any;
+		if (first.type === 'PARAGRAPH') return first.value;
+		return [plain(text)];
 	}
 
 	private parseParagraph() {
