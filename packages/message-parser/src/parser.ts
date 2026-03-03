@@ -46,12 +46,21 @@ import {
 	unorderedList,
 	spoilerBlock,
 	spoiler,
+	timestamp,
+	timestampFromHours,
+	timestampFromIsoTime,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
 import type { Options } from './index';
 import { EMOTICONS, EMOTICON_LIST } from './emoticons';
 import { MENTION_USER_RE, EMOJI_CODE_RE, UNICODE_EMOJI_RE, URL_TRAILING_CHARS, PHONE_URL_RE, EMAIL_PATTERN } from './patterns';
+
+// =============================================================================
+// TIMESTAMP
+// =============================================================================
+
+const VALID_TIMESTAMP_FORMATS = new Set(['t', 'T', 'd', 'D', 'f', 'F', 'R']);
 
 // =============================================================================
 // TOKEN STREAM
@@ -832,7 +841,7 @@ class Parser {
 		}
 
 		// Plain token — may still contain @mentions, emoji shortcodes and emoticons
-		if (this.stream.check(PlainToken)) return this.parsePlainToken();
+		if (this.stream.check(PlainToken)) return this.parsePlainToken(ctx);
 
 		// CodeFence inside a paragraph — treat as plain text (e.g. "  ```")
 		if (this.stream.check(CodeFence)) return plain(this.stream.consume().image);
@@ -1082,10 +1091,6 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// LINK [label](url)
-	// ===========================================================================
-
-	// ===========================================================================
 	// IMAGE — ![label](url)
 	// ===========================================================================
 
@@ -1182,14 +1187,6 @@ class Parser {
 		}
 		return link(urlRaw, label);
 	}
-
-	// ===========================================================================
-	// PLAIN TOKEN — now only handles emoji shortcodes and emoticons.
-	// Email, URL, Phone are handled as dedicated lexer tokens above.
-	//
-	// Underscore merging: still needed for word-internal cases like joe_roe@joe.com.
-	// Now also merges when _ is followed by Email (e.g. local_part@domain.com).
-	// ===========================================================================
 
 	// ===========================================================================
 	// INLINE SPOILER — ||content||
@@ -1337,7 +1334,68 @@ class Parser {
 		return color(r, g, b, a);
 	}
 
-	private parsePlainToken(): Inlines {
+	// ===========================================================================
+	// TIMESTAMP TAG — <t:value> or <t:value:format>
+	// Supports:
+	//   - Unix epoch:              <t:1708551317>  or  <t:1708551317:R>
+	//   - ISO datetime:            <t:2025-07-22T10:00:00.000+00:00:R>
+	//   - Relative HH:MM[:SS]+TZ: <t:10:00:00+00:00:R>  or  <t:10:00+00:00>
+	// Returns null when the tag is invalid (invalid format char, epoch too short).
+	// ===========================================================================
+	private parseTimestampTag(raw: string): Inlines | null {
+		// raw is the full string e.g. "<t:1708551317:R>"
+		// strip leading "<t:" and trailing ">"
+		const inner = raw.slice(3, -1);
+
+		// Split off trailing :FORMAT if the last segment is exactly 1 letter
+		let value = inner;
+		let format = 't'; // default
+
+		const lastColon = inner.lastIndexOf(':');
+		if (lastColon !== -1) {
+			const candidate = inner.slice(lastColon + 1);
+			if (candidate.length === 1 && /[a-zA-Z]/.test(candidate)) {
+				format = candidate;
+				value = inner.slice(0, lastColon);
+			}
+		}
+
+		// Validate format char
+		if (!VALID_TIMESTAMP_FORMATS.has(format)) return null;
+
+		let unixSeconds: number;
+
+		// 1. Pure unix epoch — all digits
+		if (/^\d+$/.test(value)) {
+			if (value.length < 5) return null; // too short e.g. <t:17>
+			unixSeconds = parseInt(value, 10);
+		}
+		// 2. ISO 8601 datetime — contains a T
+		else if (value.includes('T')) {
+			// Use the existing timestampFromIsoTime helper via Date.parse for simplicity
+			const ms = Date.parse(value);
+			if (isNaN(ms)) return null;
+			unixSeconds = Math.floor(ms / 1000);
+		}
+		// 3. Relative HH:MM[:SS]+TZ  e.g. "10:00:00+00:00" or "10:00+00:00"
+		else {
+			const m = value.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?([+-]\d{2}:\d{2}|Z)$/);
+			if (!m) return null;
+
+			const hours = m[1];
+			const minutes = m[2];
+			const seconds = m[3] ?? '00';
+			const tz = m[4];
+
+			const tsStr = timestampFromHours(hours, minutes, seconds, tz);
+			unixSeconds = parseInt(tsStr, 10);
+			if (isNaN(unixSeconds)) return null;
+		}
+
+		return timestamp(String(unixSeconds), format as any);
+	}
+
+	private parsePlainToken(ctx: FormattingContext = {}): Inlines {
 		let text = this.stream.consume().image;
 
 		// Merge _ + Plain/Email tokens for word-internal cases like joe_roe@joe.com
@@ -1356,27 +1414,17 @@ class Parser {
 		}
 
 		// Merge Plain + Email when Email starts with _ and plain ends with a word char.
-		// e.g. Plain("(joe") + Email("_roe@joe.com") → text = "(joe_roe@joe.com)"
-		// This happens because _ is in EMAIL_PATTERN's local-part charset, so Chevrotain
-		// tokenizes "_roe@joe.com" as one Email token instead of SC("_") + Email("roe@...").
 		while (this.stream.check(EmailToken) && this.stream.peek()!.image.startsWith('_') && /[a-zA-Z0-9]/.test(text.slice(-1))) {
 			text += this.stream.consume().image;
 		}
 
 		// Merge Plain + Email when plain text ends with @ — the lexer split
 		// "@username@example.com" into Plain("@username@" or "@") + Email("username@example.com").
-		// Absorb the email so splitPlainText sees the full string and matches it as a mention.
 		while (text.endsWith('@') && this.stream.check(EmailToken)) {
 			text += this.stream.consume().image;
 		}
 
 		// Scan for an email address embedded in the plain text.
-		// Needed because the Plain token greedily consumes @ when it appears mid-sentence
-		// (e.g. "Joe's email is joe@joe.com" is one Plain token since Plain is tried after
-		// Email at each position, but only wins when the text doesn't start with a valid
-		// email local-part).
-		// Skip the embedded email scan when text starts with @ — splitPlainText will
-		// handle it as a mention (e.g. @username@example.com must not become a mailto link).
 		const emailRe = new RegExp(EMAIL_PATTERN.source, 'g');
 		const emailMatch = text.startsWith('@') ? null : emailRe.exec(text);
 		if (emailMatch) {
@@ -1385,10 +1433,9 @@ class Parser {
 			const after = text.slice(emailMatch.index + matchedEmail.length);
 			const address = matchedEmail.startsWith('mailto:') ? matchedEmail.slice(7) : matchedEmail;
 			const emailNode = autoEmail(address);
-			// If autoEmail returned plain (invalid TLD etc.), fall through to splitPlainText
 			if (emailNode.type !== 'PLAIN_TEXT') {
 				if (after.length > 0) {
-					const afterNodes = this.splitPlainText(after);
+					const afterNodes = this.splitPlainText(after, ctx.inBold);
 					this.pending.unshift(emailNode, ...afterNodes);
 				} else {
 					this.pending.unshift(emailNode);
@@ -1398,20 +1445,38 @@ class Parser {
 			}
 		}
 
-		const nodes = this.splitPlainText(text);
+		const nodes = this.splitPlainText(text, ctx.inBold);
 		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
 		return nodes[0];
 	}
 
-	// Split plain text at @mention, emoji shortcode, and emoticon boundaries.
-	// URL/email/phone are now handled as dedicated lexer tokens.
-	// @mention stays here due to word-boundary context requirement.
-	private splitPlainText(text: string): Inlines[] {
+	// Split plain text at @mention, emoji shortcode, emoticon, and timestamp boundaries.
+	// The `noTimestamp` flag is true when inside bold (*...*) — the bold test expects
+	// <t:...> to remain as plain text inside bold formatting.
+	private splitPlainText(text: string, noTimestamp = false): Inlines[] {
 		const results: Inlines[] = [];
 		let remaining = text;
 		let prevChar = '';
 
 		while (remaining.length > 0) {
+			// ── Timestamp tag <t:...> ────────────────────────────────────────────
+			if (!noTimestamp) {
+				const tsMatch = remaining.match(/<t:[^>]+>/);
+				if (tsMatch && tsMatch.index !== undefined) {
+					const tsNode = this.parseTimestampTag(tsMatch[0]);
+					if (tsMatch.index > 0) results.push(plain(remaining.slice(0, tsMatch.index)));
+					if (tsNode) {
+						results.push(tsNode);
+					} else {
+						// Invalid tag — emit as plain text
+						results.push(plain(tsMatch[0]));
+					}
+					prevChar = '>';
+					remaining = remaining.slice(tsMatch.index + tsMatch[0].length);
+					continue;
+				}
+			}
+
 			// @mention
 			const mentionMatch = remaining.match(MENTION_USER_RE);
 			let mentionIdx = mentionMatch?.index ?? Infinity;
@@ -1560,11 +1625,53 @@ class Parser {
 }
 
 // =============================================================================
+// TIMESTAMP PRE-LEXER
+// <t:...> tags may contain characters like + : . that the lexer splits into
+// multiple tokens. To handle them correctly we scan the raw input string,
+// replace each <t:...> tag with a plain-text sentinel that the lexer treats
+// as a single Plain token, lex the result, then replace the sentinels back.
+// =============================================================================
+
+const TIMESTAMP_TAG_RE = /<t:[^>]+>/g;
+const SENTINEL_PREFIX = '\x00TS\x00'; // unlikely to appear in real messages
+
+function encodeTimestampSentinels(input: string): { encoded: string; map: string[] } {
+	const map: string[] = [];
+	const encoded = input.replace(TIMESTAMP_TAG_RE, (match) => {
+		const idx = map.length;
+		map.push(match);
+		// Sentinel must not contain any lexer-special chars (* _ ~ ` # \ [ ] \n +)
+		// Use only alphanumeric + the NUL-based prefix so it becomes one Plain token.
+		return `${SENTINEL_PREFIX}${idx}${SENTINEL_PREFIX}`;
+	});
+	return { encoded, map };
+}
+
+// =============================================================================
 // PUBLIC API
 // =============================================================================
 
 export const parse = (input: string, options?: Options): Root => {
-	const { tokens, errors } = MessageLexer.tokenize(input);
+	const { encoded, map } = encodeTimestampSentinels(input);
+
+	// If there are no timestamp tags, skip the sentinel dance entirely.
+	if (map.length === 0) {
+		const { tokens, errors } = MessageLexer.tokenize(input);
+		if (errors.length > 0) throw new Error(`Lexer error: ${errors[0].message}`);
+		return new Parser(new TokenStream(tokens), options).parseMessage();
+	}
+
+	const { tokens, errors } = MessageLexer.tokenize(encoded);
 	if (errors.length > 0) throw new Error(`Lexer error: ${errors[0].message}`);
+
+	// Walk the token list and expand any sentinel Plain tokens back into the
+	// original <t:...> tag text so splitPlainText can find them.
+	const sentinelRe = new RegExp(`${SENTINEL_PREFIX}(\\d+)${SENTINEL_PREFIX}`, 'g');
+	for (const tok of tokens) {
+		if (tok.tokenType.name === 'Plain') {
+			tok.image = tok.image.replace(sentinelRe, (_, idx) => map[Number(idx)]);
+		}
+	}
+
 	return new Parser(new TokenStream(tokens), options).parseMessage();
 };
