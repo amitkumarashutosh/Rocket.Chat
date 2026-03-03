@@ -51,7 +51,7 @@ import {
 import type { Root, Inlines, Markup } from './definitions';
 import type { Options } from './index';
 import { EMOTICONS, EMOTICON_LIST } from './emoticons';
-import { MENTION_USER_RE, EMOJI_CODE_RE, UNICODE_EMOJI_RE, URL_TRAILING_CHARS, PHONE_URL_RE } from './patterns';
+import { MENTION_USER_RE, EMOJI_CODE_RE, UNICODE_EMOJI_RE, URL_TRAILING_CHARS, PHONE_URL_RE, EMAIL_PATTERN } from './patterns';
 
 // =============================================================================
 // TOKEN STREAM
@@ -1323,6 +1323,40 @@ class Parser {
 		) {
 			text += this.stream.consume().image; // _
 			text += this.stream.consume().image; // Plain or Email
+		}
+
+		// Merge Plain + Email when Email starts with _ and plain ends with a word char.
+		// e.g. Plain("(joe") + Email("_roe@joe.com") → text = "(joe_roe@joe.com)"
+		// This happens because _ is in EMAIL_PATTERN's local-part charset, so Chevrotain
+		// tokenizes "_roe@joe.com" as one Email token instead of SC("_") + Email("roe@...").
+		while (this.stream.check(EmailToken) && this.stream.peek()!.image.startsWith('_') && /[a-zA-Z0-9]/.test(text.slice(-1))) {
+			text += this.stream.consume().image;
+		}
+
+		// Scan for an email address embedded in the plain text.
+		// Needed because the Plain token greedily consumes @ when it appears mid-sentence
+		// (e.g. "Joe's email is joe@joe.com" is one Plain token since Plain is tried after
+		// Email at each position, but only wins when the text doesn't start with a valid
+		// email local-part).
+		const emailRe = new RegExp(EMAIL_PATTERN.source, 'g');
+		const emailMatch = emailRe.exec(text);
+		if (emailMatch) {
+			const before = text.slice(0, emailMatch.index);
+			const matchedEmail = emailMatch[0];
+			const after = text.slice(emailMatch.index + matchedEmail.length);
+			const address = matchedEmail.startsWith('mailto:') ? matchedEmail.slice(7) : matchedEmail;
+			const emailNode = autoEmail(address);
+			// If autoEmail returned plain (invalid TLD etc.), fall through to splitPlainText
+			if (emailNode.type !== 'PLAIN_TEXT') {
+				if (after.length > 0) {
+					const afterNodes = this.splitPlainText(after);
+					this.pending.unshift(emailNode, ...afterNodes);
+				} else {
+					this.pending.unshift(emailNode);
+				}
+				if (before.length > 0) return plain(before);
+				return this.pending.shift()!;
+			}
 		}
 
 		const nodes = this.splitPlainText(text);
