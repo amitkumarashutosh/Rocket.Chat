@@ -54,7 +54,51 @@ import {
 import type { Root, Inlines, Markup } from './definitions';
 import type { Options } from './index';
 import { EMOTICONS, EMOTICON_LIST } from './emoticons';
-import { MENTION_USER_RE, EMOJI_CODE_RE, UNICODE_EMOJI_RE, URL_TRAILING_CHARS, PHONE_URL_RE, EMAIL_PATTERN } from './patterns';
+import {
+	MENTION_USER_RE,
+	EMOJI_CODE_RE,
+	UNICODE_EMOJI_RE,
+	URL_TRAILING_CHARS,
+	PHONE_URL_RE,
+	EMAIL_PATTERN,
+	WORD_CHAR_RE,
+	WORD_CHAR_WITH_DOT_RE,
+	WHITESPACE_RE,
+	WHITESPACE_OR_COLON_RE,
+	NON_SPACE_START_RE,
+	ALPHA_RE,
+	NON_DIGIT_RE,
+	GENERIC_WORD_CHAR_RE,
+	ORDERED_LIST_RE,
+	ORDERED_LIST_ITEM_RE,
+	HEX_COLOR_RE,
+	TIMESTAMP_TAG_RE,
+	TIMESTAMP_SENTINEL_PREFIX,
+	buildSentinelRe,
+	TIMESTAMP_RELATIVE_RE,
+	TIMESTAMP_EPOCH_RE,
+	TIMESTAMP_INLINE_RE,
+	AT_DOMAIN_RE,
+	MENTION_TRAILING_UNDERSCORE_RE,
+} from './patterns';
+
+// =============================================================================
+// MODULE-LEVEL COMPILED REGEX CACHE
+// Hoisted out of all hot-path functions so they are never re-constructed
+// per call. Stateful `g`-flag regexes must have lastIndex reset before reuse.
+// =============================================================================
+
+// Reusable emoji shortcode regex — has `g` flag, reset lastIndex before each use.
+const _emojiCodeRe = new RegExp(EMOJI_CODE_RE.source, 'g');
+
+// Email pattern compiled once for parsePlainToken.
+const _emailRe = new RegExp(EMAIL_PATTERN.source, 'g');
+
+// Sentinel restore pattern compiled once for the public `parse` entry point.
+const _sentinelRe = buildSentinelRe(TIMESTAMP_SENTINEL_PREFIX);
+
+// EMOTICON_LIST length cached to avoid repeated property lookups in the hot loop.
+const _emoticonCount = EMOTICON_LIST.length;
 
 // =============================================================================
 // TIMESTAMP
@@ -96,7 +140,6 @@ class TokenStream {
 		return this.tokens[i];
 	}
 
-	// Inject tokens at the current position (used to push back re-lexed text).
 	inject(newTokens: IToken[]): void {
 		this.tokens.splice(this.pos, 0, ...newTokens);
 	}
@@ -132,11 +175,9 @@ function stripUrlTrailing(url: string): [string, string] {
 }
 
 function isWordChar(ch: string | undefined): boolean {
-	return ch !== undefined && /[a-zA-Z0-9]/.test(ch);
+	return ch !== undefined && WORD_CHAR_RE.test(ch);
 }
 
-// Returns the last character of the token immediately before position pos,
-// looking across all token types (Plain, Email, Url, Phone, SpecialChar…).
 function prevTokenLastChar(stream: TokenStream, pos: number): string | undefined {
 	if (pos === 0) return undefined;
 	return stream.tokenAt(pos - 1)?.image?.slice(-1);
@@ -151,12 +192,16 @@ function tryMakeBigEmoji(blocks: any[]): Root {
 
 	for (const block of blocks) {
 		if (block.type === 'LINE_BREAK') continue;
+		// Early exit: non-PARAGRAPH block immediately disqualifies
 		if (block.type !== 'PARAGRAPH') return blocks;
 
 		for (const node of block.value) {
 			if (node.type === 'PLAIN_TEXT') {
+				// Early exit: non-whitespace plain text disqualifies
 				if (node.value.trim() !== '') return blocks;
 			} else if (node.type === 'EMOJI') {
+				// Early exit: already at the 3-emoji limit
+				if (emojis.length === 3) return blocks;
 				emojis.push(node);
 			} else {
 				return blocks;
@@ -164,7 +209,7 @@ function tryMakeBigEmoji(blocks: any[]): Root {
 		}
 	}
 
-	if (emojis.length === 0 || emojis.length > 3) return blocks;
+	if (emojis.length === 0) return blocks;
 	return [bigEmoji(emojis as any)];
 }
 
@@ -202,15 +247,11 @@ class Parser {
 					count += this.stream.consume().image.length;
 				}
 				if (blocks.length > 0) {
-					// A trailing \n after a heading counts as one lineBreak;
-					// between paragraphs each extra \n beyond the first is a lineBreak.
 					const lastType = blocks[blocks.length - 1]?.type;
-					// After headings and spoiler blocks, every \n (including single) counts as a lineBreak.
-					// After paragraphs, only extra \n beyond the first separator count.
 					const trailingNewlineIsBreak = lastType === 'HEADING' || lastType === 'SPOILER_BLOCK';
 					let breaksToAdd: number;
 					if (trailingNewlineIsBreak) {
-						breaksToAdd = this.stream.isAtEnd() ? count : count - 1 + 1; // every \n is a break
+						breaksToAdd = this.stream.isAtEnd() ? count : count - 1 + 1;
 					} else {
 						breaksToAdd = this.stream.isAtEnd() ? 0 : count - 1;
 					}
@@ -219,7 +260,6 @@ class Parser {
 				continue;
 			}
 
-			// Block KaTeX — \[ ... \] (only when katex.parenthesisSyntax is enabled)
 			if ((this.options as any).katex?.parenthesisSyntax && this.stream.check(LiteralBackslash)) {
 				const block = this.tryParseBlockKatex();
 				if (block) {
@@ -228,13 +268,10 @@ class Parser {
 				}
 			}
 
-			// Code block — ``` must be at the very start of a line.
-			// Guard: only attempt if we're at position 0 or the previous token was a newline.
 			if (this.stream.check(CodeFence)) {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
 				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseCodeBlock();
 					if (block) {
@@ -244,7 +281,6 @@ class Parser {
 				}
 			}
 
-			// Blockquote — > or >text lines, only at line start.
 			if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('>')) {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
@@ -258,7 +294,6 @@ class Parser {
 				}
 			}
 
-			// Spoiler block — || on its own line opens/closes the block.
 			if (this.stream.check(PlainToken) && this.stream.peek()!.image === '||') {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
@@ -272,7 +307,6 @@ class Parser {
 				}
 			}
 
-			// Unordered list — "- item" (Plain starting with "- "), only at line start.
 			if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('- ')) {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
@@ -286,7 +320,6 @@ class Parser {
 				}
 			}
 
-			// Unordered list — "* item" (SpecialChar("*") + Plain(" item")), only at line start.
 			if (this.stream.checkImage(SpecialChar, '*')) {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
@@ -302,8 +335,7 @@ class Parser {
 				}
 			}
 
-			// Ordered list — <number>. <content> lines, only at line start.
-			if (this.stream.check(PlainToken) && /^\d+\.\s/.test(this.stream.peek()!.image)) {
+			if (this.stream.check(PlainToken) && ORDERED_LIST_RE.test(this.stream.peek()!.image)) {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
 				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
@@ -316,12 +348,10 @@ class Parser {
 				}
 			}
 
-			// Heading — # / ## / ### / #### followed by a space, only at line start.
 			if (this.stream.checkImage(SpecialChar, '#')) {
 				const pos = this.stream.getPos();
 				const prevTok = this.stream.tokenAt(pos - 1);
 				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseHeading();
 					if (block) {
@@ -344,14 +374,11 @@ class Parser {
 
 	private tryParseCodeBlock(): any | null {
 		const savedPos = this.stream.getPos();
-		const openTok = this.stream.consume(); // consume the ``` token
+		const openTok = this.stream.consume();
 
-		// Extract optional language label from the opening fence token image
-		// e.g. "```javascript" → "javascript", "```" → undefined
 		const rawLang = openTok.image.slice(3).trim();
 		const lang = rawLang.length > 0 ? rawLang : undefined;
 
-		// Opening fence must be followed by a newline
 		if (!this.stream.match(NewLine)) {
 			this.stream.setPos(savedPos);
 			return null;
@@ -360,17 +387,15 @@ class Parser {
 		const lines: any[] = [];
 
 		while (!this.stream.isAtEnd()) {
-			// Closing fence
 			if (this.stream.check(CodeFence)) {
 				this.stream.consume();
 				return code(lines, lang);
 			}
 
-			// Collect raw text for one line until we hit a newline token
 			const lineParts: string[] = [];
 
 			while (!this.stream.isAtEnd()) {
-				if (this.stream.check(CodeFence)) break; // will be caught by outer loop
+				if (this.stream.check(CodeFence)) break;
 
 				if (this.stream.check(NewLine)) {
 					this.stream.consume();
@@ -378,14 +403,10 @@ class Parser {
 				}
 
 				if (this.stream.check(DoubleNewLine)) {
-					// DoubleNewLine = "\n\n" — push the current line, then a blank line,
-					// then stop collecting (the second \n is already consumed).
 					this.stream.consume();
 					lines.push(codeLine(plain(lineParts.join(''))));
 					lines.push(codeLine(plain('')));
 					lineParts.length = 0;
-					// Signal that we already pushed, skip the push below
-					// by setting a flag via a sentinel
 					(lineParts as any).__alreadyPushed = true;
 					break;
 				}
@@ -398,7 +419,6 @@ class Parser {
 			}
 		}
 
-		// No closing fence found — not a valid code block
 		this.stream.setPos(savedPos);
 		return null;
 	}
@@ -410,14 +430,12 @@ class Parser {
 	private tryParseHeading(): any | null {
 		const savedPos = this.stream.getPos();
 
-		// Count consecutive # SpecialChars (max 4)
 		let level = 0;
 		while (this.stream.checkImage(SpecialChar, '#') && level < 4) {
 			this.stream.consume();
 			level++;
 		}
 
-		// Must be followed by a Plain token starting with a space
 		const next = this.stream.peek();
 		if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith(' ')) {
 			this.stream.setPos(savedPos);
@@ -425,16 +443,12 @@ class Parser {
 		}
 
 		const tok = this.stream.consume();
-		const text = tok.image.slice(1); // strip leading space
+		const text = tok.image.slice(1);
 
-		// Collect any remaining tokens on this line (do NOT consume the newline)
 		const parts: string[] = [text];
 		while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 			parts.push(this.stream.consume().image);
 		}
-
-		// Emit the trailing newline back so parseMessage can count it for lineBreak
-		// We intentionally leave it in the stream — parseMessage's newline loop handles it.
 
 		return heading([plain(parts.join(''))], level as 1 | 2 | 3 | 4);
 	}
@@ -447,20 +461,20 @@ class Parser {
 		const savedPos = this.stream.getPos();
 
 		if (!this.stream.check(LiteralBackslash)) return null;
-		this.stream.consume(); // \
+		this.stream.consume();
 
 		if (!this.stream.checkImage(SpecialChar, '[')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-		this.stream.consume(); // [
+		this.stream.consume();
 
 		const parts: string[] = [];
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(LiteralBackslash)) {
-				this.stream.consume(); // \
+				this.stream.consume();
 				if (this.stream.checkImage(SpecialChar, ']')) {
-					this.stream.consume(); // ]
+					this.stream.consume();
 					return katex(parts.join(''));
 				}
 				parts.push('\\');
@@ -480,23 +494,21 @@ class Parser {
 	private tryParseInlineKatex(): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		this.stream.consume(); // \
+		this.stream.consume();
 
-		// Next token must be a Plain token starting with (
 		const next = this.stream.peek();
 		if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith('(')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 		this.stream.consume();
-		const afterParen = next.image.slice(1); // strip leading (
+		const afterParen = next.image.slice(1);
 
-		// Collect until \)
 		const parts: string[] = [afterParen];
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(NewLine) || this.stream.check(DoubleNewLine)) break;
 			if (this.stream.check(LiteralBackslash)) {
-				this.stream.consume(); // \
+				this.stream.consume();
 				const t = this.stream.peek();
 				if (t && t.tokenType.name === PlainToken.name && t.image.startsWith(')')) {
 					this.stream.consume();
@@ -515,7 +527,7 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// BLOCKQUOTE — consecutive > lines
+	// BLOCKQUOTE
 	// ===========================================================================
 
 	private tryParseQuote(): any | null {
@@ -523,30 +535,22 @@ class Parser {
 		const paragraphs: any[] = [];
 
 		while (!this.stream.isAtEnd()) {
-			// Check we have a Plain token starting with >
 			if (!this.stream.check(PlainToken) || !this.stream.peek()!.image.startsWith('>')) break;
 
 			const tok = this.stream.consume();
-			// Strip the leading > and optional single space
 			let line = tok.image.slice(1);
 			if (line.startsWith(' ')) line = line.slice(1);
 
-			// Collect any remaining tokens on this line (e.g. Email, Url, SpecialChar tokens)
 			const lineParts: string[] = [line];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-			const lineText = lineParts.join('');
 
-			// Re-parse the line content using a sub-parser
-			const lineInlines = this.parseQuoteLine(lineText);
+			const lineInlines = this.parseQuoteLine(lineParts.join(''));
 			paragraphs.push(paragraph(reducePlainTexts(lineInlines)));
 
-			// Consume the newline separator between quote lines
 			if (this.stream.check(NewLine)) {
 				this.stream.consume();
-			} else if (this.stream.check(DoubleNewLine)) {
-				break;
 			} else {
 				break;
 			}
@@ -560,19 +564,16 @@ class Parser {
 		return quote(paragraphs);
 	}
 
-	// Parse a single quote line's text as inlines by re-lexing and re-parsing it.
 	private parseQuoteLine(text: string): Inlines[] {
 		const { tokens, errors } = MessageLexer.tokenize(text);
 		if (errors.length > 0) return [plain(text)];
 		if (tokens.length === 0) return [plain('')];
 		const subStream = new TokenStream(tokens);
 		const subParser = new Parser(subStream, this.options);
-		// Use parseParagraph directly to avoid block-level checks interfering
 		const inlines = (subParser as any).parseParagraphInlines();
 		return reducePlainTexts(inlines) as Inlines[];
 	}
 
-	// Parse all inlines until end of stream (used by parseQuoteLine)
 	parseParagraphInlines(): Inlines[] {
 		const inlines: Inlines[] = [];
 		while (!this.stream.isAtEnd() || this.pending.length > 0) {
@@ -584,39 +585,34 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// SPOILER BLOCK — || ... ||
+	// SPOILER BLOCK
 	// ===========================================================================
 
 	private tryParseSpoilerBlock(): any | null {
 		const savedPos = this.stream.getPos();
 
-		// Opening ||
 		if (!this.stream.check(PlainToken) || this.stream.peek()!.image !== '||') return null;
-		this.stream.consume(); // ||
+		this.stream.consume();
 
-		// Must be followed immediately by a newline
 		if (!this.stream.check(NewLine)) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-		this.stream.consume(); // newline after opening ||
+		this.stream.consume();
 
 		const paragraphs: any[] = [];
 
 		while (!this.stream.isAtEnd()) {
-			// Closing || on its own line
 			if (this.stream.check(PlainToken) && this.stream.peek()!.image === '||') {
-				this.stream.consume(); // closing ||
+				this.stream.consume();
 				return spoilerBlock(paragraphs);
 			}
 
-			// Collect one line of tokens
 			const lineParts: string[] = [];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-			const lineText = lineParts.join('');
-			const inlines = this.parseQuoteLine(lineText);
+			const inlines = this.parseQuoteLine(lineParts.join(''));
 			paragraphs.push(paragraph(reducePlainTexts(inlines)));
 
 			if (this.stream.check(NewLine)) {
@@ -626,13 +622,12 @@ class Parser {
 			}
 		}
 
-		// No closing || found
 		this.stream.setPos(savedPos);
 		return null;
 	}
 
 	// ===========================================================================
-	// UNORDERED LIST — consecutive "- item" or "* item" lines
+	// UNORDERED LIST
 	// ===========================================================================
 
 	private tryParseUnorderedList(marker: '-' | '*'): any | null {
@@ -643,21 +638,18 @@ class Parser {
 			let lineText: string;
 
 			if (marker === '-') {
-				// Plain token starting with "- "
 				if (!this.stream.check(PlainToken) || !this.stream.peek()!.image.startsWith('- ')) break;
 				const tok = this.stream.consume();
-				lineText = tok.image.slice(2); // strip "- "
+				lineText = tok.image.slice(2);
 			} else {
-				// SpecialChar("*") + Plain(" item...")
 				if (!this.stream.checkImage(SpecialChar, '*')) break;
 				const nextTok = this.stream.peekAt(1);
 				if (!nextTok || nextTok.tokenType.name !== PlainToken.name || !nextTok.image.startsWith(' ')) break;
-				this.stream.consume(); // *
-				const tok = this.stream.consume(); // " item..."
-				lineText = tok.image.slice(1); // strip leading space
+				this.stream.consume();
+				const tok = this.stream.consume();
+				lineText = tok.image.slice(1);
 			}
 
-			// Collect remaining tokens on this line (e.g. SpecialChar for bold/italic)
 			const lineParts: string[] = [lineText];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
@@ -682,7 +674,7 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// ORDERED LIST — consecutive <number>. <content> lines
+	// ORDERED LIST
 	// ===========================================================================
 
 	private tryParseOrderedList(): any | null {
@@ -690,28 +682,24 @@ class Parser {
 		const items: any[] = [];
 
 		while (!this.stream.isAtEnd()) {
-			// Check for <number>. <content> pattern in Plain token
 			if (!this.stream.check(PlainToken)) break;
 			const tok = this.stream.peek()!;
-			const m = tok.image.match(/^(\d+)\.\s(.*)/s);
+			const m = tok.image.match(ORDERED_LIST_ITEM_RE);
 			if (!m) break;
 
 			this.stream.consume();
 			const num = parseInt(m[1], 10);
 			let lineText = m[2];
 
-			// Collect remaining tokens on this line
 			const lineParts: string[] = [lineText];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
 			lineText = lineParts.join('');
 
-			// Parse line content as inlines via sub-parser
 			const inlines = this.parseQuoteLine(lineText);
 			items.push(listItem(inlines, num));
 
-			// Consume newline between items
 			if (this.stream.check(NewLine)) {
 				this.stream.consume();
 			} else {
@@ -751,16 +739,11 @@ class Parser {
 	private parseInline(ctx: FormattingContext): Inlines | null {
 		if (this.stream.check(Escape)) return this.parseEscape();
 
-		// LiteralBackslash: \\ not followed by a special escape char.
 		if (this.stream.check(LiteralBackslash)) {
-			// Inline KaTeX \(content\) takes priority when enabled.
 			if ((this.options as any).katex?.parenthesisSyntax) {
 				const node = this.tryParseInlineKatex();
 				if (node) return node;
 			}
-			// Otherwise (or if KaTeX parse failed): consume the backslash.
-			// If followed by a SpecialChar like [, absorb it as plain text so
-			// \[ does not open a link.
 			const bsImage = this.stream.consume().image;
 			const next = this.stream.peek();
 			if (next && next.tokenType.name === SpecialChar.name) {
@@ -769,31 +752,26 @@ class Parser {
 			return plain(bsImage);
 		}
 
-		// Bold *
 		if (this.stream.checkImage(SpecialChar, '*') && !ctx.inBold) {
 			const node = this.tryParseFormatting('*', ctx);
 			if (node) return node;
 		}
 
-		// Italic _
 		if (this.stream.checkImage(SpecialChar, '_') && !ctx.inItalic) {
 			const node = this.tryParseItalic(ctx);
 			if (node) return node;
 		}
 
-		// Strike ~
 		if (this.stream.checkImage(SpecialChar, '~') && !ctx.inStrike) {
 			const node = this.tryParseFormatting('~', ctx);
 			if (node) return node;
 		}
 
-		// Inline Code
 		if (this.stream.checkImage(SpecialChar, '`')) {
 			const node = this.tryParseInlineCode();
 			if (node) return node;
 		}
 
-		// Image ![label](url) — Plain ending with ! followed by [
 		if (
 			this.stream.check(PlainToken) &&
 			this.stream.peek()!.image.endsWith('!') &&
@@ -804,46 +782,32 @@ class Parser {
 			if (node) return node;
 		}
 
-		// Link [label](url)
 		if (this.stream.checkImage(SpecialChar, '[')) {
 			const node = this.tryParseLink(ctx);
 			if (node) return node;
 		}
 
-		// #channel — # is SpecialChar, followed by Plain
 		if (this.stream.checkImage(SpecialChar, '#')) {
 			const node = this.tryParseChannelMention();
 			if (node) return node;
 		}
 
-		// ── Tokens moved from splitPlainText ──────────────────────────────────
-
-		// Email token — foo@bar.com or mailto:foo@bar.com
 		if (this.stream.check(EmailToken)) return this.parseEmailToken();
-
-		// URL token — http://... or www....
 		if (this.stream.check(UrlToken)) return this.parseUrlToken();
-
-		// Phone token — +44...
 		if (this.stream.check(PhoneToken)) return this.parsePhoneToken();
 
-		// Inline spoiler — ||content||
 		if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('||')) {
 			const node = this.tryParseInlineSpoiler(ctx);
 			if (node) return node;
 		}
 
-		// Color token — color:#rrggbb etc. spans Plain("color:") + SpecialChar("#") + Plain(<hex>)
-		// Always intercept this pattern (even when colors disabled) to prevent # becoming a channel mention.
 		if (this.stream.check(PlainToken) && this.stream.peek()!.image === 'color:') {
 			const node = this.tryParseColor();
 			if (node) return node;
 		}
 
-		// Plain token — may still contain @mentions, emoji shortcodes and emoticons
 		if (this.stream.check(PlainToken)) return this.parsePlainToken(ctx);
 
-		// CodeFence inside a paragraph — treat as plain text (e.g. "  ```")
 		if (this.stream.check(CodeFence)) return plain(this.stream.consume().image);
 
 		return this.parseFallback();
@@ -866,9 +830,8 @@ class Parser {
 	private parseUrlToken(): Inlines {
 		const tok = this.stream.consume();
 
-		// Check if preceded by alphanumeric/dot — same guard as old splitPlainText
 		const prevChar = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
-		if (/[a-zA-Z0-9.]/.test(prevChar ?? '')) {
+		if (WORD_CHAR_WITH_DOT_RE.test(prevChar ?? '')) {
 			return plain(tok.image);
 		}
 
@@ -884,42 +847,37 @@ class Parser {
 	private parsePhoneToken(): Inlines {
 		const tok = this.stream.consume();
 
-		// Reject if preceded by a word char
 		const prevChar = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
-		if (/\w/.test(prevChar ?? '')) return plain(tok.image);
+		if (GENERIC_WORD_CHAR_RE.test(prevChar ?? '')) return plain(tok.image);
 
-		return phoneChecker(tok.image, tok.image.replace(/\D/g, ''));
+		return phoneChecker(tok.image, tok.image.replace(NON_DIGIT_RE, ''));
 	}
 
 	// ===========================================================================
-	// #CHANNEL MENTION — # is SpecialChar, rest is in Plain token
+	// #CHANNEL MENTION
 	// ===========================================================================
 
 	private tryParseChannelMention(): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		// Reject if preceded by a word char, another #, : (e.g. color:#ccc), or @ (e.g. !@#$)
 		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar)) return null;
 		if (prevChar === '#') return null;
 		if (prevChar === ':') return null;
 		if (prevChar === '@') return null;
 
-		// Reject if preceded by "color:" — this is part of a color token like color:#ccc
-		// that should stay as plain text when colors option is disabled
 		const prevTokImage = this.stream.getPos() > 0 ? this.stream.tokenAt(this.stream.getPos() - 1)?.image : undefined;
 		if (prevTokImage === 'color:') return null;
 
-		this.stream.consume(); // #
+		this.stream.consume();
 
-		// Reject if the next token is also # (e.g. still inside ##Hello at pos 0)
 		if (this.stream.checkImage(SpecialChar, '#')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 
 		const tok = this.stream.peek();
-		if (tok?.tokenType.name === PlainToken.name && !/^\s/.test(tok.image)) {
+		if (tok?.tokenType.name === PlainToken.name && NON_SPACE_START_RE.test(tok.image)) {
 			this.stream.consume();
 			const name = tok.image.split(' ')[0];
 			const rest = tok.image.slice(name.length);
@@ -938,7 +896,7 @@ class Parser {
 	private tryParseFormatting(delim: '*' | '~', ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		this.stream.consume(); // first delim
+		this.stream.consume();
 		const isDouble = this.stream.checkImage(SpecialChar, delim);
 		if (isDouble) this.stream.consume();
 
@@ -964,7 +922,6 @@ class Parser {
 					closed = true;
 					break;
 				} else if (isDouble && !closingDouble) {
-					// Opened ** but only one closing → emit plain opener, reparse as single
 					this.stream.setPos(savedPos + 1);
 					const single = this.tryParseFormatting(delim, ctx);
 					if (single) {
@@ -975,7 +932,7 @@ class Parser {
 					return null;
 				} else if (!isDouble && closingDouble) {
 					closed = true;
-					break; // leave extra delim in stream
+					break;
 				} else {
 					closed = true;
 					break;
@@ -1002,17 +959,16 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// ITALIC (_) — word boundary rules
+	// ITALIC (_)
 	// ===========================================================================
 
 	private tryParseItalic(ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		// Reject if preceded by word char (mid-word _ not italic)
 		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar)) return null;
 
-		this.stream.consume(); // first _
+		this.stream.consume();
 		const isDouble = this.stream.checkImage(SpecialChar, '_');
 		if (isDouble) this.stream.consume();
 
@@ -1046,7 +1002,6 @@ class Parser {
 						if (node) inner.push(node);
 						continue;
 					}
-					// Emit plain opener, reparse as single
 					this.stream.setPos(savedPos + 1);
 					const single = this.tryParseItalic(ctx);
 					if (single) {
@@ -1097,14 +1052,11 @@ class Parser {
 	private tryParseImage(ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		// Consume the Plain token ending with !
 		const plainTok = this.stream.consume();
-		const prefix = plainTok.image.slice(0, -1); // everything before the !
+		const prefix = plainTok.image.slice(0, -1);
 
-		// Consume [
 		this.stream.consume();
 
-		// Parse label (may be empty)
 		const labelNodes = this.parseLinkLabel(ctx);
 
 		if (!this.stream.matchImage(SpecialChar, ']')) {
@@ -1118,7 +1070,6 @@ class Parser {
 			return null;
 		}
 
-		// If there was text before the !, push image to pending and return the prefix
 		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes)[0] as any) : undefined;
 		const imgNode = image(urlRaw, label);
 
@@ -1132,7 +1083,7 @@ class Parser {
 
 	private tryParseLink(ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
-		this.stream.consume(); // [
+		this.stream.consume();
 
 		const labelNodes = this.parseLinkLabel(ctx);
 
@@ -1182,27 +1133,25 @@ class Parser {
 		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes) as Markup[]) : undefined;
 
 		if (PHONE_URL_RE.test(urlRaw)) {
-			const digits = urlRaw.replace(/\D/g, '');
+			const digits = urlRaw.replace(NON_DIGIT_RE, '');
 			if (digits.length >= 5) return link(`tel:${digits}`, label ?? [plain(urlRaw)]);
 		}
 		return link(urlRaw, label);
 	}
 
 	// ===========================================================================
-	// INLINE SPOILER — ||content||
+	// INLINE SPOILER
 	// ===========================================================================
 
 	private tryParseInlineSpoiler(ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
 		const tok = this.stream.peek()!;
-		const afterOpen = tok.image.slice(2); // strip leading ||
+		const afterOpen = tok.image.slice(2);
 
-		// |||| (empty) — not a valid spoiler
 		if (tok.image === '||||') return null;
 
-		this.stream.consume(); // consume the Plain token starting with ||
+		this.stream.consume();
 
-		// Check if closing || is in the same token (e.g. "||spoiler||" is one Plain token)
 		const closeIdx = afterOpen.indexOf('||');
 		if (closeIdx !== -1) {
 			const innerText = afterOpen.slice(0, closeIdx);
@@ -1212,15 +1161,10 @@ class Parser {
 				return null;
 			}
 			const inner = this.parseQuoteLine(innerText);
-			// Re-lex the rest and push back through the main parser via pending
-			// so that further ||spoilers||, @mentions, #channels etc. are parsed correctly.
-			if (rest.length > 0) {
-				this.pendingFromText(rest);
-			}
+			if (rest.length > 0) this.pendingFromText(rest);
 			return spoiler(inner as any);
 		}
 
-		// Closing || is in a later token — collect raw text + tokens until found
 		const parts: string[] = [afterOpen];
 
 		while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
@@ -1237,23 +1181,17 @@ class Parser {
 						return null;
 					}
 					const inner = this.parseQuoteLine(innerText);
-					if (rest.length > 0) {
-						this.pendingFromText(rest);
-					}
+					if (rest.length > 0) this.pendingFromText(rest);
 					return spoiler(inner as any);
 				}
 			}
 			parts.push(this.stream.consume().image);
 		}
 
-		// No closing || found — restore and return null (treated as plain text by parsePlainToken)
 		this.stream.setPos(savedPos);
 		return null;
 	}
 
-	// Re-lex a raw text string and inject the resulting tokens back into the main
-	// stream at the current position. This allows the main parser to handle them
-	// properly (e.g. ||spoilers||, @mentions, #channels inside rest text).
 	private pendingFromText(text: string): void {
 		if (text.length === 0) return;
 		const { tokens, errors } = MessageLexer.tokenize(text);
@@ -1265,24 +1203,20 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// COLOR — color:#rgb / #rgba / #rrggbb / #rrggbbaa
-	// Tokens: Plain("color:") + SpecialChar("#") + Plain("<hex>")
+	// COLOR
 	// ===========================================================================
 
 	private tryParseColor(): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		// Consume Plain("color:")
 		this.stream.consume();
 
-		// Must be followed by SpecialChar("#")
 		if (!this.stream.checkImage(SpecialChar, '#')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-		this.stream.consume(); // #
+		this.stream.consume();
 
-		// Must be followed by a Plain token containing only hex chars of valid length
 		const hexTok = this.stream.peek();
 		if (!hexTok || hexTok.tokenType.name !== PlainToken.name) {
 			this.stream.setPos(savedPos);
@@ -1291,16 +1225,14 @@ class Parser {
 
 		const hex = hexTok.image;
 		const validLen = hex.length === 3 || hex.length === 4 || hex.length === 6 || hex.length === 8;
-		const validChars = /^[0-9a-fA-F]+$/.test(hex);
+		const validChars = HEX_COLOR_RE.test(hex);
 
 		if (!validLen || !validChars) {
-			// Invalid hex — emit color: + # + hexTok all as plain text to prevent
-			// the # being parsed as a channel mention
-			this.stream.consume(); // # already consumed above, consume hex too
+			this.stream.consume();
 			this.pending.push(plain('#' + hex));
 			return plain('color:');
 		}
-		this.stream.consume(); // hex token
+		this.stream.consume();
 
 		let r = 0,
 			g = 0,
@@ -1326,7 +1258,6 @@ class Parser {
 			a = parseInt(hex.slice(6, 8), 16);
 		}
 
-		// colors option disabled — emit as plain text
 		if (!(this.options as any).colors) {
 			return plain('color:#' + hex);
 		}
@@ -1335,59 +1266,40 @@ class Parser {
 	}
 
 	// ===========================================================================
-	// TIMESTAMP TAG — <t:value> or <t:value:format>
-	// Supports:
-	//   - Unix epoch:              <t:1708551317>  or  <t:1708551317:R>
-	//   - ISO datetime:            <t:2025-07-22T10:00:00.000+00:00:R>
-	//   - Relative HH:MM[:SS]+TZ: <t:10:00:00+00:00:R>  or  <t:10:00+00:00>
-	// Returns null when the tag is invalid (invalid format char, epoch too short).
+	// TIMESTAMP TAG
 	// ===========================================================================
+
 	private parseTimestampTag(raw: string): Inlines | null {
-		// raw is the full string e.g. "<t:1708551317:R>"
-		// strip leading "<t:" and trailing ">"
 		const inner = raw.slice(3, -1);
 
-		// Split off trailing :FORMAT if the last segment is exactly 1 letter
 		let value = inner;
-		let format = 't'; // default
+		let format = 't';
 
 		const lastColon = inner.lastIndexOf(':');
 		if (lastColon !== -1) {
 			const candidate = inner.slice(lastColon + 1);
-			if (candidate.length === 1 && /[a-zA-Z]/.test(candidate)) {
+			if (candidate.length === 1 && ALPHA_RE.test(candidate)) {
 				format = candidate;
 				value = inner.slice(0, lastColon);
 			}
 		}
 
-		// Validate format char
 		if (!VALID_TIMESTAMP_FORMATS.has(format)) return null;
 
 		let unixSeconds: number;
 
-		// 1. Pure unix epoch — all digits
-		if (/^\d+$/.test(value)) {
-			if (value.length < 5) return null; // too short e.g. <t:17>
+		if (TIMESTAMP_EPOCH_RE.test(value)) {
+			if (value.length < 5) return null;
 			unixSeconds = parseInt(value, 10);
-		}
-		// 2. ISO 8601 datetime — contains a T
-		else if (value.includes('T')) {
-			// Use the existing timestampFromIsoTime helper via Date.parse for simplicity
+		} else if (value.includes('T')) {
 			const ms = Date.parse(value);
 			if (isNaN(ms)) return null;
 			unixSeconds = Math.floor(ms / 1000);
-		}
-		// 3. Relative HH:MM[:SS]+TZ  e.g. "10:00:00+00:00" or "10:00+00:00"
-		else {
-			const m = value.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?([+-]\d{2}:\d{2}|Z)$/);
+		} else {
+			const m = value.match(TIMESTAMP_RELATIVE_RE);
 			if (!m) return null;
 
-			const hours = m[1];
-			const minutes = m[2];
-			const seconds = m[3] ?? '00';
-			const tz = m[4];
-
-			const tsStr = timestampFromHours(hours, minutes, seconds, tz);
+			const tsStr = timestampFromHours(m[1], m[2], m[3] ?? '00', m[4]);
 			unixSeconds = parseInt(tsStr, 10);
 			if (isNaN(unixSeconds)) return null;
 		}
@@ -1395,38 +1307,36 @@ class Parser {
 		return timestamp(String(unixSeconds), format as any);
 	}
 
+	// ===========================================================================
+	// PLAIN TOKEN — hot path
+	// ===========================================================================
+
 	private parsePlainToken(ctx: FormattingContext = {}): Inlines {
 		let text = this.stream.consume().image;
 
-		// Merge _ + Plain/Email tokens for word-internal cases like joe_roe@joe.com
 		while (
 			this.stream.checkImage(SpecialChar, '_') &&
-			// _ followed by Plain that doesn't start with space or _
 			((this.stream.peekAt(1)?.tokenType.name === PlainToken.name &&
-				!/^\s/.test(this.stream.peekAt(1)!.image) &&
-				!/^_/.test(this.stream.peekAt(1)!.image)) ||
-				// _ followed by Email (e.g. local_part@domain.com)
+				NON_SPACE_START_RE.test(this.stream.peekAt(1)!.image) &&
+				!this.stream.peekAt(1)!.image.startsWith('_')) ||
 				this.stream.peekAt(1)?.tokenType.name === EmailToken.name) &&
-			/[a-zA-Z0-9]/.test(text.slice(-1))
+			WORD_CHAR_RE.test(text.slice(-1))
 		) {
-			text += this.stream.consume().image; // _
-			text += this.stream.consume().image; // Plain or Email
-		}
-
-		// Merge Plain + Email when Email starts with _ and plain ends with a word char.
-		while (this.stream.check(EmailToken) && this.stream.peek()!.image.startsWith('_') && /[a-zA-Z0-9]/.test(text.slice(-1))) {
+			text += this.stream.consume().image;
 			text += this.stream.consume().image;
 		}
 
-		// Merge Plain + Email when plain text ends with @ — the lexer split
-		// "@username@example.com" into Plain("@username@" or "@") + Email("username@example.com").
+		while (this.stream.check(EmailToken) && this.stream.peek()!.image.startsWith('_') && WORD_CHAR_RE.test(text.slice(-1))) {
+			text += this.stream.consume().image;
+		}
+
 		while (text.endsWith('@') && this.stream.check(EmailToken)) {
 			text += this.stream.consume().image;
 		}
 
-		// Scan for an email address embedded in the plain text.
-		const emailRe = new RegExp(EMAIL_PATTERN.source, 'g');
-		const emailMatch = text.startsWith('@') ? null : emailRe.exec(text);
+		// Reuse module-level compiled regex — reset lastIndex before exec
+		_emailRe.lastIndex = 0;
+		const emailMatch = text.startsWith('@') ? null : _emailRe.exec(text);
 		if (emailMatch) {
 			const before = text.slice(0, emailMatch.index);
 			const matchedEmail = emailMatch[0];
@@ -1450,27 +1360,23 @@ class Parser {
 		return nodes[0];
 	}
 
-	// Split plain text at @mention, emoji shortcode, emoticon, and timestamp boundaries.
-	// The `noTimestamp` flag is true when inside bold (*...*) — the bold test expects
-	// <t:...> to remain as plain text inside bold formatting.
+	// ===========================================================================
+	// SPLIT PLAIN TEXT — hot path
+	// All RegExp objects are module-level constants; none are constructed here.
+	// ===========================================================================
 	private splitPlainText(text: string, noTimestamp = false): Inlines[] {
 		const results: Inlines[] = [];
 		let remaining = text;
 		let prevChar = '';
 
 		while (remaining.length > 0) {
-			// ── Timestamp tag <t:...> ────────────────────────────────────────────
+			// Timestamp tag <t:...>
 			if (!noTimestamp) {
-				const tsMatch = remaining.match(/<t:[^>]+>/);
+				const tsMatch = remaining.match(TIMESTAMP_INLINE_RE);
 				if (tsMatch && tsMatch.index !== undefined) {
-					const tsNode = this.parseTimestampTag(tsMatch[0]);
 					if (tsMatch.index > 0) results.push(plain(remaining.slice(0, tsMatch.index)));
-					if (tsNode) {
-						results.push(tsNode);
-					} else {
-						// Invalid tag — emit as plain text
-						results.push(plain(tsMatch[0]));
-					}
+					const tsNode = this.parseTimestampTag(tsMatch[0]);
+					results.push(tsNode ?? plain(tsMatch[0]));
 					prevChar = '>';
 					remaining = remaining.slice(tsMatch.index + tsMatch[0].length);
 					continue;
@@ -1480,22 +1386,20 @@ class Parser {
 			// @mention
 			const mentionMatch = remaining.match(MENTION_USER_RE);
 			let mentionIdx = mentionMatch?.index ?? Infinity;
-
-			// Reject if preceded by word char
 			if (mentionMatch && mentionIdx !== Infinity) {
 				const cb = mentionIdx > 0 ? remaining[mentionIdx - 1] : prevChar;
-				if (/[a-zA-Z0-9]/.test(cb)) mentionIdx = Infinity;
+				if (WORD_CHAR_RE.test(cb)) mentionIdx = Infinity;
 			}
 
-			// Emoji shortcode
+			// Emoji shortcode — reuse module-level instance, reset lastIndex
 			let emojiIdx = Infinity;
 			let emojiMatch: RegExpMatchArray | null = null;
-			const emojiRe = new RegExp(EMOJI_CODE_RE.source, 'g');
+			_emojiCodeRe.lastIndex = 0;
 			let em: RegExpMatchArray | null;
-			while ((em = emojiRe.exec(remaining)) !== null) {
+			while ((em = _emojiCodeRe.exec(remaining)) !== null) {
 				const before = em.index! > 0 ? remaining[em.index! - 1] : prevChar;
 				const after = remaining[em.index! + em[0].length];
-				if ((em.index === 0 || /[\s:]/.test(before)) && (after === undefined || /[\s:]/.test(after))) {
+				if ((em.index === 0 || WHITESPACE_OR_COLON_RE.test(before)) && (after === undefined || WHITESPACE_OR_COLON_RE.test(after))) {
 					emojiIdx = em.index!;
 					emojiMatch = em;
 					break;
@@ -1515,22 +1419,25 @@ class Parser {
 			let emoticonIdx = Infinity;
 			let emoticonKey = '';
 			if (this.options.emoticons) {
-				for (const key of EMOTICON_LIST) {
+				for (let i = 0; i < _emoticonCount; i++) {
+					const key = EMOTICON_LIST[i];
 					const idx = remaining.indexOf(key);
-					if (idx === -1) continue;
+					// Skip immediately if not found or already beaten by a closer match
+					if (idx === -1 || idx >= emoticonIdx) continue;
 					const before = idx > 0 ? remaining[idx - 1] : prevChar;
 					const after = remaining[idx + key.length];
-					const validBefore = idx === 0 ? prevChar === '' || /\s/.test(prevChar) : /\s/.test(before);
-					const validAfter = after === undefined || /\s/.test(after) || this.startsEmoticon(after + remaining.slice(idx + key.length + 1));
-					if (validBefore && validAfter && idx < emoticonIdx) {
+					const validBefore = idx === 0 ? prevChar === '' || WHITESPACE_RE.test(prevChar) : WHITESPACE_RE.test(before);
+					const validAfter =
+						after === undefined || WHITESPACE_RE.test(after) || this.startsEmoticon(after + remaining.slice(idx + key.length + 1));
+					if (validBefore && validAfter) {
 						emoticonIdx = idx;
 						emoticonKey = key;
 					}
 				}
 			}
 
-			// No matches — entire remaining string is plain text
-			if ([mentionIdx, emojiIdx, unicodeIdx, emoticonIdx].every((i) => i === Infinity)) {
+			// Fast path: no matches at all
+			if (mentionIdx === Infinity && emojiIdx === Infinity && unicodeIdx === Infinity && emoticonIdx === Infinity) {
 				results.push(plain(remaining));
 				break;
 			}
@@ -1542,18 +1449,15 @@ class Parser {
 				let mentionText = mentionMatch![0];
 				let afterMention = remaining.slice(mentionIdx + mentionText.length);
 
-				// If the mention is immediately followed by @domain (e.g. @username@example.com),
-				// absorb the @domain part into the mention value.
-				const domainMatch = afterMention.match(/^@[^\s]+/);
+				const domainMatch = afterMention.match(AT_DOMAIN_RE);
 				if (domainMatch) {
 					mentionText += domainMatch[0];
 					afterMention = afterMention.slice(domainMatch[0].length);
 				}
 
-				// Strip trailing underscores — they may be italic delimiters
-				const stripped = mentionText.replace(/_+$/, '');
+				const stripped = mentionText.replace(MENTION_TRAILING_UNDERSCORE_RE, '');
 				const leftover = mentionText.slice(stripped.length);
-				results.push(mentionUser(stripped.slice(1))); // strip @
+				results.push(mentionUser(stripped.slice(1)));
 				prevChar = stripped.slice(-1);
 				remaining = leftover + afterMention;
 			} else if (minIdx === emojiIdx) {
@@ -1565,7 +1469,6 @@ class Parser {
 				prevChar = unicodeMatch![0].slice(-1);
 				remaining = remaining.slice(unicodeIdx + unicodeMatch![0].length);
 			} else {
-				// Emoticon
 				results.push(emoticonNode(emoticonKey, EMOTICONS[emoticonKey]));
 				prevChar = emoticonKey.slice(-1);
 				remaining = remaining.slice(emoticonIdx + emoticonKey.length);
@@ -1575,7 +1478,6 @@ class Parser {
 		return results;
 	}
 
-	// Check if a string starts with a known emoticon
 	private startsEmoticon(s: string): boolean {
 		return EMOTICON_LIST.some((k: any) => s.startsWith(k));
 	}
@@ -1598,7 +1500,7 @@ class Parser {
 
 	private tryParseInlineCode(): Inlines | null {
 		const savedPos = this.stream.getPos();
-		this.stream.consume(); // opening `
+		this.stream.consume();
 
 		const parts: string[] = [];
 
@@ -1606,13 +1508,11 @@ class Parser {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
 
 			if (this.stream.checkImage(SpecialChar, '`')) {
-				this.stream.consume(); // closing `
-
+				this.stream.consume();
 				if (parts.length === 0) {
 					this.stream.setPos(savedPos);
 					return null;
 				}
-
 				return inlineCode(plain(parts.join('')));
 			}
 
@@ -1626,23 +1526,14 @@ class Parser {
 
 // =============================================================================
 // TIMESTAMP PRE-LEXER
-// <t:...> tags may contain characters like + : . that the lexer splits into
-// multiple tokens. To handle them correctly we scan the raw input string,
-// replace each <t:...> tag with a plain-text sentinel that the lexer treats
-// as a single Plain token, lex the result, then replace the sentinels back.
 // =============================================================================
-
-const TIMESTAMP_TAG_RE = /<t:[^>]+>/g;
-const SENTINEL_PREFIX = '\x00TS\x00'; // unlikely to appear in real messages
 
 function encodeTimestampSentinels(input: string): { encoded: string; map: string[] } {
 	const map: string[] = [];
 	const encoded = input.replace(TIMESTAMP_TAG_RE, (match) => {
 		const idx = map.length;
 		map.push(match);
-		// Sentinel must not contain any lexer-special chars (* _ ~ ` # \ [ ] \n +)
-		// Use only alphanumeric + the NUL-based prefix so it becomes one Plain token.
-		return `${SENTINEL_PREFIX}${idx}${SENTINEL_PREFIX}`;
+		return `${TIMESTAMP_SENTINEL_PREFIX}${idx}${TIMESTAMP_SENTINEL_PREFIX}`;
 	});
 	return { encoded, map };
 }
@@ -1654,7 +1545,6 @@ function encodeTimestampSentinels(input: string): { encoded: string; map: string
 export const parse = (input: string, options?: Options): Root => {
 	const { encoded, map } = encodeTimestampSentinels(input);
 
-	// If there are no timestamp tags, skip the sentinel dance entirely.
 	if (map.length === 0) {
 		const { tokens, errors } = MessageLexer.tokenize(input);
 		if (errors.length > 0) throw new Error(`Lexer error: ${errors[0].message}`);
@@ -1664,12 +1554,11 @@ export const parse = (input: string, options?: Options): Root => {
 	const { tokens, errors } = MessageLexer.tokenize(encoded);
 	if (errors.length > 0) throw new Error(`Lexer error: ${errors[0].message}`);
 
-	// Walk the token list and expand any sentinel Plain tokens back into the
-	// original <t:...> tag text so splitPlainText can find them.
-	const sentinelRe = new RegExp(`${SENTINEL_PREFIX}(\\d+)${SENTINEL_PREFIX}`, 'g');
+	// Reuse module-level sentinel regex — reset lastIndex before use
+	_sentinelRe.lastIndex = 0;
 	for (const tok of tokens) {
 		if (tok.tokenType.name === 'Plain') {
-			tok.image = tok.image.replace(sentinelRe, (_, idx) => map[Number(idx)]);
+			tok.image = tok.image.replace(_sentinelRe, (_, idx) => map[Number(idx)]);
 		}
 	}
 
