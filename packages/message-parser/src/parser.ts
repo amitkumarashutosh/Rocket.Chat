@@ -41,6 +41,8 @@ import {
 	quote,
 	color,
 	image,
+	orderedList,
+	listItem,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -224,6 +226,20 @@ class Parser {
 				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseQuote();
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
+			// Ordered list — <number>. <content> lines, only at line start.
+			if (this.stream.check(PlainToken) && /^\d+\.\s/.test(this.stream.peek()!.image)) {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+				if (pos === 0 || prevIsNewline) {
+					const block = this.tryParseOrderedList();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -479,14 +495,69 @@ class Parser {
 	private parseQuoteLine(text: string): Inlines[] {
 		const { tokens, errors } = MessageLexer.tokenize(text);
 		if (errors.length > 0) return [plain(text)];
+		if (tokens.length === 0) return [plain('')];
 		const subStream = new TokenStream(tokens);
 		const subParser = new Parser(subStream, this.options);
-		const result = subParser.parseMessage();
-		// result is Root = Array<Paragraph|Blocks> — extract inlines from first paragraph
-		if (result.length === 0) return [plain('')];
-		const first = result[0] as any;
-		if (first.type === 'PARAGRAPH') return first.value;
-		return [plain(text)];
+		// Use parseParagraph directly to avoid block-level checks interfering
+		const inlines = (subParser as any).parseParagraphInlines();
+		return reducePlainTexts(inlines) as Inlines[];
+	}
+
+	// Parse all inlines until end of stream (used by parseQuoteLine)
+	parseParagraphInlines(): Inlines[] {
+		const inlines: Inlines[] = [];
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
+			const node = this.nextInline({});
+			if (node) inlines.push(node);
+		}
+		return inlines;
+	}
+
+	// ===========================================================================
+	// ORDERED LIST — consecutive <number>. <content> lines
+	// ===========================================================================
+
+	private tryParseOrderedList(): any | null {
+		const savedPos = this.stream.getPos();
+		const items: any[] = [];
+
+		while (!this.stream.isAtEnd()) {
+			// Check for <number>. <content> pattern in Plain token
+			if (!this.stream.check(PlainToken)) break;
+			const tok = this.stream.peek()!;
+			const m = tok.image.match(/^(\d+)\.\s(.*)/s);
+			if (!m) break;
+
+			this.stream.consume();
+			const num = parseInt(m[1], 10);
+			let lineText = m[2];
+
+			// Collect remaining tokens on this line
+			const lineParts: string[] = [lineText];
+			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
+				lineParts.push(this.stream.consume().image);
+			}
+			lineText = lineParts.join('');
+
+			// Parse line content as inlines via sub-parser
+			const inlines = this.parseQuoteLine(lineText);
+			items.push(listItem(inlines, num));
+
+			// Consume newline between items
+			if (this.stream.check(NewLine)) {
+				this.stream.consume();
+			} else {
+				break;
+			}
+		}
+
+		if (items.length === 0) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		return orderedList(items);
 	}
 
 	private parseParagraph() {
