@@ -39,6 +39,7 @@ import {
 	katex,
 	inlineKatex,
 	quote,
+	color,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -564,6 +565,13 @@ class Parser {
 		// Phone token — +44...
 		if (this.stream.check(PhoneToken)) return this.parsePhoneToken();
 
+		// Color token — color:#rrggbb etc. spans Plain("color:") + SpecialChar("#") + Plain(<hex>)
+		// Always intercept this pattern (even when colors disabled) to prevent # becoming a channel mention.
+		if (this.stream.check(PlainToken) && this.stream.peek()!.image === 'color:') {
+			const node = this.tryParseColor();
+			if (node) return node;
+		}
+
 		// Plain token — may still contain @mentions, emoji shortcodes and emoticons
 		if (this.stream.check(PlainToken)) return this.parsePlainToken();
 
@@ -622,13 +630,16 @@ class Parser {
 	private tryParseChannelMention(): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		// Reject if preceded by a word char (mid-word # is not a mention)
+		// Reject if preceded by a word char, another #, or : (e.g. color:#ccc)
 		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar)) return null;
-
-		// Reject if preceded by another # (handles ##Hello case where first # was
-		// emitted as plain and now we're at the second #)
 		if (prevChar === '#') return null;
+		if (prevChar === ':') return null;
+
+		// Reject if preceded by "color:" — this is part of a color token like color:#ccc
+		// that should stay as plain text when colors option is disabled
+		const prevTokImage = this.stream.getPos() > 0 ? this.stream.tokenAt(this.stream.getPos() - 1)?.image : undefined;
+		if (prevTokImage === 'color:') return null;
 
 		this.stream.consume(); // #
 
@@ -879,6 +890,76 @@ class Parser {
 	// Underscore merging: still needed for word-internal cases like joe_roe@joe.com.
 	// Now also merges when _ is followed by Email (e.g. local_part@domain.com).
 	// ===========================================================================
+
+	// ===========================================================================
+	// COLOR — color:#rgb / #rgba / #rrggbb / #rrggbbaa
+	// Tokens: Plain("color:") + SpecialChar("#") + Plain("<hex>")
+	// ===========================================================================
+
+	private tryParseColor(): Inlines | null {
+		const savedPos = this.stream.getPos();
+
+		// Consume Plain("color:")
+		this.stream.consume();
+
+		// Must be followed by SpecialChar("#")
+		if (!this.stream.checkImage(SpecialChar, '#')) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+		this.stream.consume(); // #
+
+		// Must be followed by a Plain token containing only hex chars of valid length
+		const hexTok = this.stream.peek();
+		if (!hexTok || hexTok.tokenType.name !== PlainToken.name) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		const hex = hexTok.image;
+		const validLen = hex.length === 3 || hex.length === 4 || hex.length === 6 || hex.length === 8;
+		const validChars = /^[0-9a-fA-F]+$/.test(hex);
+
+		if (!validLen || !validChars) {
+			// Invalid hex — emit color: + # + hexTok all as plain text to prevent
+			// the # being parsed as a channel mention
+			this.stream.consume(); // # already consumed above, consume hex too
+			this.pending.push(plain('#' + hex));
+			return plain('color:');
+		}
+		this.stream.consume(); // hex token
+
+		let r = 0,
+			g = 0,
+			b = 0,
+			a = 255;
+		if (hex.length === 3) {
+			r = parseInt(hex[0] + hex[0], 16);
+			g = parseInt(hex[1] + hex[1], 16);
+			b = parseInt(hex[2] + hex[2], 16);
+		} else if (hex.length === 4) {
+			r = parseInt(hex[0] + hex[0], 16);
+			g = parseInt(hex[1] + hex[1], 16);
+			b = parseInt(hex[2] + hex[2], 16);
+			a = parseInt(hex[3] + hex[3], 16);
+		} else if (hex.length === 6) {
+			r = parseInt(hex.slice(0, 2), 16);
+			g = parseInt(hex.slice(2, 4), 16);
+			b = parseInt(hex.slice(4, 6), 16);
+		} else {
+			r = parseInt(hex.slice(0, 2), 16);
+			g = parseInt(hex.slice(2, 4), 16);
+			b = parseInt(hex.slice(4, 6), 16);
+			a = parseInt(hex.slice(6, 8), 16);
+		}
+
+		// colors option disabled — emit as plain text
+		if (!(this.options as any).colors) {
+			return plain('color:#' + hex);
+		}
+
+		return color(r, g, b, a);
+	}
 
 	private parsePlainToken(): Inlines {
 		let text = this.stream.consume().image;
