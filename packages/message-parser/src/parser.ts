@@ -1345,13 +1345,22 @@ class Parser {
 			text += this.stream.consume().image;
 		}
 
+		// Merge Plain + Email when plain text ends with @ — the lexer split
+		// "@username@example.com" into Plain("@username@" or "@") + Email("username@example.com").
+		// Absorb the email so splitPlainText sees the full string and matches it as a mention.
+		while (text.endsWith('@') && this.stream.check(EmailToken)) {
+			text += this.stream.consume().image;
+		}
+
 		// Scan for an email address embedded in the plain text.
 		// Needed because the Plain token greedily consumes @ when it appears mid-sentence
 		// (e.g. "Joe's email is joe@joe.com" is one Plain token since Plain is tried after
 		// Email at each position, but only wins when the text doesn't start with a valid
 		// email local-part).
+		// Skip the embedded email scan when text starts with @ — splitPlainText will
+		// handle it as a mention (e.g. @username@example.com must not become a mailto link).
 		const emailRe = new RegExp(EMAIL_PATTERN.source, 'g');
-		const emailMatch = emailRe.exec(text);
+		const emailMatch = text.startsWith('@') ? null : emailRe.exec(text);
 		if (emailMatch) {
 			const before = text.slice(0, emailMatch.index);
 			const matchedEmail = emailMatch[0];
@@ -1448,12 +1457,22 @@ class Parser {
 
 			if (minIdx === mentionIdx) {
 				let mentionText = mentionMatch![0];
+				let afterMention = remaining.slice(mentionIdx + mentionText.length);
+
+				// If the mention is immediately followed by @domain (e.g. @username@example.com),
+				// absorb the @domain part into the mention value.
+				const domainMatch = afterMention.match(/^@[^\s]+/);
+				if (domainMatch) {
+					mentionText += domainMatch[0];
+					afterMention = afterMention.slice(domainMatch[0].length);
+				}
+
 				// Strip trailing underscores — they may be italic delimiters
 				const stripped = mentionText.replace(/_+$/, '');
 				const leftover = mentionText.slice(stripped.length);
 				results.push(mentionUser(stripped.slice(1))); // strip @
 				prevChar = stripped.slice(-1);
-				remaining = leftover + remaining.slice(mentionIdx + mentionText.length);
+				remaining = leftover + afterMention;
 			} else if (minIdx === emojiIdx) {
 				results.push(emoji(emojiMatch![0].slice(1, -1)));
 				prevChar = ':';
