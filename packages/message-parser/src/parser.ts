@@ -87,6 +87,11 @@ class TokenStream {
 		return this.tokens[i];
 	}
 
+	// Inject tokens at the current position (used to push back re-lexed text).
+	inject(newTokens: IToken[]): void {
+		this.tokens.splice(this.pos, 0, ...newTokens);
+	}
+
 	check(type: { name: string }): boolean {
 		return this.peek()?.tokenType.name === type.name;
 	}
@@ -561,7 +566,7 @@ class Parser {
 	// Parse all inlines until end of stream (used by parseQuoteLine)
 	parseParagraphInlines(): Inlines[] {
 		const inlines: Inlines[] = [];
-		while (!this.stream.isAtEnd()) {
+		while (!this.stream.isAtEnd() || this.pending.length > 0) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
 			const node = this.nextInline({});
 			if (node) inlines.push(node);
@@ -884,11 +889,12 @@ class Parser {
 	private tryParseChannelMention(): Inlines | null {
 		const savedPos = this.stream.getPos();
 
-		// Reject if preceded by a word char, another #, or : (e.g. color:#ccc)
+		// Reject if preceded by a word char, another #, : (e.g. color:#ccc), or @ (e.g. !@#$)
 		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar)) return null;
 		if (prevChar === '#') return null;
 		if (prevChar === ':') return null;
+		if (prevChar === '@') return null;
 
 		// Reject if preceded by "color:" — this is part of a color token like color:#ccc
 		// that should stay as plain text when colors option is disabled
@@ -1209,10 +1215,10 @@ class Parser {
 				return null;
 			}
 			const inner = this.parseQuoteLine(innerText);
-			// Re-lex the rest so it can be parsed (e.g. " and ||second||")
+			// Re-lex the rest and push back through the main parser via pending
+			// so that further ||spoilers||, @mentions, #channels etc. are parsed correctly.
 			if (rest.length > 0) {
-				const restNodes = this.parseQuoteLine(rest);
-				this.pending.push(...restNodes);
+				this.pendingFromText(rest);
 			}
 			return spoiler(inner as any);
 		}
@@ -1235,8 +1241,7 @@ class Parser {
 					}
 					const inner = this.parseQuoteLine(innerText);
 					if (rest.length > 0) {
-						const restNodes = this.parseQuoteLine(rest);
-						this.pending.push(...restNodes);
+						this.pendingFromText(rest);
 					}
 					return spoiler(inner as any);
 				}
@@ -1247,6 +1252,19 @@ class Parser {
 		// No closing || found — restore and return null (treated as plain text by parsePlainToken)
 		this.stream.setPos(savedPos);
 		return null;
+	}
+
+	// Re-lex a raw text string and inject the resulting tokens back into the main
+	// stream at the current position. This allows the main parser to handle them
+	// properly (e.g. ||spoilers||, @mentions, #channels inside rest text).
+	private pendingFromText(text: string): void {
+		if (text.length === 0) return;
+		const { tokens, errors } = MessageLexer.tokenize(text);
+		if (errors.length > 0 || tokens.length === 0) {
+			this.pending.push(plain(text));
+			return;
+		}
+		this.stream.inject(tokens);
 	}
 
 	// ===========================================================================
