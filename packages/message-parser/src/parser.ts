@@ -44,6 +44,8 @@ import {
 	orderedList,
 	listItem,
 	unorderedList,
+	spoilerBlock,
+	spoiler,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -188,8 +190,16 @@ class Parser {
 				if (blocks.length > 0) {
 					// A trailing \n after a heading counts as one lineBreak;
 					// between paragraphs each extra \n beyond the first is a lineBreak.
-					const lastIsHeading = blocks[blocks.length - 1]?.type === 'HEADING';
-					const breaksToAdd = lastIsHeading ? count - 1 + (this.stream.isAtEnd() ? 1 : 0) : this.stream.isAtEnd() ? 0 : count - 1;
+					const lastType = blocks[blocks.length - 1]?.type;
+					// After headings and spoiler blocks, every \n (including single) counts as a lineBreak.
+					// After paragraphs, only extra \n beyond the first separator count.
+					const trailingNewlineIsBreak = lastType === 'HEADING' || lastType === 'SPOILER_BLOCK';
+					let breaksToAdd: number;
+					if (trailingNewlineIsBreak) {
+						breaksToAdd = this.stream.isAtEnd() ? count : count - 1 + 1; // every \n is a break
+					} else {
+						breaksToAdd = this.stream.isAtEnd() ? 0 : count - 1;
+					}
 					for (let i = 0; i < breaksToAdd; i++) blocks.push(lineBreak());
 				}
 				continue;
@@ -227,6 +237,20 @@ class Parser {
 				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseQuote();
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
+			// Spoiler block — || on its own line opens/closes the block.
+			if (this.stream.check(PlainToken) && this.stream.peek()!.image === '||') {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+				if (pos === 0 || prevIsNewline) {
+					const block = this.tryParseSpoilerBlock();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -546,6 +570,54 @@ class Parser {
 	}
 
 	// ===========================================================================
+	// SPOILER BLOCK — || ... ||
+	// ===========================================================================
+
+	private tryParseSpoilerBlock(): any | null {
+		const savedPos = this.stream.getPos();
+
+		// Opening ||
+		if (!this.stream.check(PlainToken) || this.stream.peek()!.image !== '||') return null;
+		this.stream.consume(); // ||
+
+		// Must be followed immediately by a newline
+		if (!this.stream.check(NewLine)) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+		this.stream.consume(); // newline after opening ||
+
+		const paragraphs: any[] = [];
+
+		while (!this.stream.isAtEnd()) {
+			// Closing || on its own line
+			if (this.stream.check(PlainToken) && this.stream.peek()!.image === '||') {
+				this.stream.consume(); // closing ||
+				return spoilerBlock(paragraphs);
+			}
+
+			// Collect one line of tokens
+			const lineParts: string[] = [];
+			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
+				lineParts.push(this.stream.consume().image);
+			}
+			const lineText = lineParts.join('');
+			const inlines = this.parseQuoteLine(lineText);
+			paragraphs.push(paragraph(reducePlainTexts(inlines)));
+
+			if (this.stream.check(NewLine)) {
+				this.stream.consume();
+			} else if (this.stream.check(DoubleNewLine)) {
+				break;
+			}
+		}
+
+		// No closing || found
+		this.stream.setPos(savedPos);
+		return null;
+	}
+
+	// ===========================================================================
 	// UNORDERED LIST — consecutive "- item" or "* item" lines
 	// ===========================================================================
 
@@ -728,6 +800,12 @@ class Parser {
 
 		// Phone token — +44...
 		if (this.stream.check(PhoneToken)) return this.parsePhoneToken();
+
+		// Inline spoiler — ||content||
+		if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('||')) {
+			const node = this.tryParseInlineSpoiler(ctx);
+			if (node) return node;
+		}
 
 		// Color token — color:#rrggbb etc. spans Plain("color:") + SpecialChar("#") + Plain(<hex>)
 		// Always intercept this pattern (even when colors disabled) to prevent # becoming a channel mention.
@@ -1094,6 +1172,70 @@ class Parser {
 	// Underscore merging: still needed for word-internal cases like joe_roe@joe.com.
 	// Now also merges when _ is followed by Email (e.g. local_part@domain.com).
 	// ===========================================================================
+
+	// ===========================================================================
+	// INLINE SPOILER — ||content||
+	// ===========================================================================
+
+	private tryParseInlineSpoiler(ctx: FormattingContext): Inlines | null {
+		const savedPos = this.stream.getPos();
+		const tok = this.stream.peek()!;
+		const afterOpen = tok.image.slice(2); // strip leading ||
+
+		// |||| (empty) — not a valid spoiler
+		if (tok.image === '||||') return null;
+
+		this.stream.consume(); // consume the Plain token starting with ||
+
+		// Check if closing || is in the same token (e.g. "||spoiler||" is one Plain token)
+		const closeIdx = afterOpen.indexOf('||');
+		if (closeIdx !== -1) {
+			const innerText = afterOpen.slice(0, closeIdx);
+			const rest = afterOpen.slice(closeIdx + 2);
+			if (innerText.length === 0) {
+				this.stream.setPos(savedPos);
+				return null;
+			}
+			const inner = this.parseQuoteLine(innerText);
+			// Re-lex the rest so it can be parsed (e.g. " and ||second||")
+			if (rest.length > 0) {
+				const restNodes = this.parseQuoteLine(rest);
+				this.pending.push(...restNodes);
+			}
+			return spoiler(inner as any);
+		}
+
+		// Closing || is in a later token — collect raw text + tokens until found
+		const parts: string[] = [afterOpen];
+
+		while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
+			if (this.stream.check(PlainToken)) {
+				const t = this.stream.peek()!;
+				const ci = t.image.indexOf('||');
+				if (ci !== -1) {
+					parts.push(t.image.slice(0, ci));
+					const rest = t.image.slice(ci + 2);
+					this.stream.consume();
+					const innerText = parts.join('');
+					if (innerText.length === 0) {
+						this.stream.setPos(savedPos);
+						return null;
+					}
+					const inner = this.parseQuoteLine(innerText);
+					if (rest.length > 0) {
+						const restNodes = this.parseQuoteLine(rest);
+						this.pending.push(...restNodes);
+					}
+					return spoiler(inner as any);
+				}
+			}
+			parts.push(this.stream.consume().image);
+		}
+
+		// No closing || found — restore and return null (treated as plain text by parsePlainToken)
+		this.stream.setPos(savedPos);
+		return null;
+	}
 
 	// ===========================================================================
 	// COLOR — color:#rgb / #rgba / #rrggbb / #rrggbbaa
