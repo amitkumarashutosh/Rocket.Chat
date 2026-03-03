@@ -737,10 +737,22 @@ class Parser {
 	private parseInline(ctx: FormattingContext): Inlines | null {
 		if (this.stream.check(Escape)) return this.parseEscape();
 
-		// Inline KaTeX — \(content\)
-		if ((this.options as any).katex?.parenthesisSyntax && this.stream.check(LiteralBackslash)) {
-			const node = this.tryParseInlineKatex();
-			if (node) return node;
+		// LiteralBackslash: \\ not followed by a special escape char.
+		if (this.stream.check(LiteralBackslash)) {
+			// Inline KaTeX \(content\) takes priority when enabled.
+			if ((this.options as any).katex?.parenthesisSyntax) {
+				const node = this.tryParseInlineKatex();
+				if (node) return node;
+			}
+			// Otherwise (or if KaTeX parse failed): consume the backslash.
+			// If followed by a SpecialChar like [, absorb it as plain text so
+			// \[ does not open a link.
+			const bsImage = this.stream.consume().image;
+			const next = this.stream.peek();
+			if (next && next.tokenType.name === SpecialChar.name) {
+				return plain(bsImage + this.stream.consume().image);
+			}
+			return plain(bsImage);
 		}
 
 		// Bold *
