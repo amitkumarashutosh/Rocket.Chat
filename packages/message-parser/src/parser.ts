@@ -43,6 +43,7 @@ import {
 	image,
 	orderedList,
 	listItem,
+	unorderedList,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -226,6 +227,36 @@ class Parser {
 				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
 				if (pos === 0 || prevIsNewline) {
 					const block = this.tryParseQuote();
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
+			// Unordered list — "- item" (Plain starting with "- "), only at line start.
+			if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('- ')) {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+				if (pos === 0 || prevIsNewline) {
+					const block = this.tryParseUnorderedList('-');
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+			}
+
+			// Unordered list — "* item" (SpecialChar("*") + Plain(" item")), only at line start.
+			if (this.stream.checkImage(SpecialChar, '*')) {
+				const pos = this.stream.getPos();
+				const prevTok = this.stream.tokenAt(pos - 1);
+				const prevIsNewline = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
+				const nextTok = this.stream.peekAt(1);
+				const nextIsSpace = nextTok?.tokenType.name === PlainToken.name && nextTok.image.startsWith(' ');
+				if ((pos === 0 || prevIsNewline) && nextIsSpace) {
+					const block = this.tryParseUnorderedList('*');
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -512,6 +543,56 @@ class Parser {
 			if (node) inlines.push(node);
 		}
 		return inlines;
+	}
+
+	// ===========================================================================
+	// UNORDERED LIST — consecutive "- item" or "* item" lines
+	// ===========================================================================
+
+	private tryParseUnorderedList(marker: '-' | '*'): any | null {
+		const savedPos = this.stream.getPos();
+		const items: any[] = [];
+
+		while (!this.stream.isAtEnd()) {
+			let lineText: string;
+
+			if (marker === '-') {
+				// Plain token starting with "- "
+				if (!this.stream.check(PlainToken) || !this.stream.peek()!.image.startsWith('- ')) break;
+				const tok = this.stream.consume();
+				lineText = tok.image.slice(2); // strip "- "
+			} else {
+				// SpecialChar("*") + Plain(" item...")
+				if (!this.stream.checkImage(SpecialChar, '*')) break;
+				const nextTok = this.stream.peekAt(1);
+				if (!nextTok || nextTok.tokenType.name !== PlainToken.name || !nextTok.image.startsWith(' ')) break;
+				this.stream.consume(); // *
+				const tok = this.stream.consume(); // " item..."
+				lineText = tok.image.slice(1); // strip leading space
+			}
+
+			// Collect remaining tokens on this line (e.g. SpecialChar for bold/italic)
+			const lineParts: string[] = [lineText];
+			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
+				lineParts.push(this.stream.consume().image);
+			}
+
+			const inlines = this.parseQuoteLine(lineParts.join(''));
+			items.push(listItem(inlines));
+
+			if (this.stream.check(NewLine)) {
+				this.stream.consume();
+			} else {
+				break;
+			}
+		}
+
+		if (items.length === 0) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		return unorderedList(items);
 	}
 
 	// ===========================================================================
