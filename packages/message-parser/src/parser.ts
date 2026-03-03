@@ -40,6 +40,7 @@ import {
 	inlineKatex,
 	quote,
 	color,
+	image,
 } from './utils';
 
 import type { Root, Inlines, Markup } from './definitions';
@@ -542,6 +543,17 @@ class Parser {
 			if (node) return node;
 		}
 
+		// Image ![label](url) — Plain ending with ! followed by [
+		if (
+			this.stream.check(PlainToken) &&
+			this.stream.peek()!.image.endsWith('!') &&
+			this.stream.peekAt(1)?.tokenType.name === SpecialChar.name &&
+			this.stream.peekAt(1)?.image === '['
+		) {
+			const node = this.tryParseImage(ctx);
+			if (node) return node;
+		}
+
 		// Link [label](url)
 		if (this.stream.checkImage(SpecialChar, '[')) {
 			const node = this.tryParseLink(ctx);
@@ -824,6 +836,46 @@ class Parser {
 	// ===========================================================================
 	// LINK [label](url)
 	// ===========================================================================
+
+	// ===========================================================================
+	// IMAGE — ![label](url)
+	// ===========================================================================
+
+	private tryParseImage(ctx: FormattingContext): Inlines | null {
+		const savedPos = this.stream.getPos();
+
+		// Consume the Plain token ending with !
+		const plainTok = this.stream.consume();
+		const prefix = plainTok.image.slice(0, -1); // everything before the !
+
+		// Consume [
+		this.stream.consume();
+
+		// Parse label (may be empty)
+		const labelNodes = this.parseLinkLabel(ctx);
+
+		if (!this.stream.matchImage(SpecialChar, ']')) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		const urlRaw = this.parseLinkUrl();
+		if (urlRaw === null) {
+			this.stream.setPos(savedPos);
+			return null;
+		}
+
+		// If there was text before the !, push image to pending and return the prefix
+		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes)[0] as any) : undefined;
+		const imgNode = image(urlRaw, label);
+
+		if (prefix.length > 0) {
+			this.pending.push(imgNode);
+			return plain(prefix);
+		}
+
+		return imgNode;
+	}
 
 	private tryParseLink(ctx: FormattingContext): Inlines | null {
 		const savedPos = this.stream.getPos();
