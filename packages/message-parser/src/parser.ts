@@ -1,5 +1,3 @@
-import type { IToken } from './lexer';
-
 import {
 	MessageLexer,
 	Escape,
@@ -86,46 +84,32 @@ import type { Options } from './index';
 import {
 	EMOTICONS,
 	EMOTICON_LIST,
-	MENTION_USER_RE,
-	EMOJI_CODE_RE,
-	UNICODE_EMOJI_RE,
 	URL_TRAILING_CHARS,
-	PHONE_URL_RE,
-	EMAIL_PATTERN,
-	WORD_CHAR_RE,
-	WORD_CHAR_WITH_DOT_RE,
-	WHITESPACE_RE,
-	WHITESPACE_OR_COLON_RE,
-	NON_SPACE_START_RE,
-	ALPHA_RE,
-	NON_DIGIT_RE,
-	GENERIC_WORD_CHAR_RE,
-	ORDERED_LIST_RE,
-	ORDERED_LIST_ITEM_RE,
-	HEX_COLOR_RE,
-	TIMESTAMP_TAG_RE,
-	TIMESTAMP_SENTINEL_PREFIX,
-	buildSentinelRe,
-	TIMESTAMP_RELATIVE_RE,
-	TIMESTAMP_EPOCH_RE,
-	TIMESTAMP_INLINE_RE,
-	AT_DOMAIN_RE,
-	MENTION_TRAILING_UNDERSCORE_RE,
+	encodeTimestamps,
+	decodeSentinels,
+	parseTimestampTagParts,
+	isEpochString,
+	parseRelativeTimestamp,
+	matchAtDomain,
+	stripTrailingUnderscores,
+	isPhoneUrl,
+	isOrderedListStart,
+	matchOrderedListItem,
+	isValidHexString,
+	isWordChar,
+	isWordCharWithDot,
+	isNonSpaceStart,
+	isGenericWordChar,
+	stripNonDigits,
+	findEmailInText,
+	scanPlainText,
+	type ScanHit,
 } from './patterns';
 
 import { TokenStream } from './token-stream';
 
 // =============================================================================
-// MODULE-LEVEL COMPILED REGEX CACHE
-// =============================================================================
-
-const _emojiCodeRe: RegExp = new RegExp(EMOJI_CODE_RE.source, 'g');
-const _emailRe: RegExp = new RegExp(EMAIL_PATTERN.source, 'g');
-const _sentinelRe: RegExp = buildSentinelRe(TIMESTAMP_SENTINEL_PREFIX);
-const _emoticonCount: number = EMOTICON_LIST.length;
-
-// =============================================================================
-// TIMESTAMP
+// CONSTANTS
 // =============================================================================
 
 const VALID_TIMESTAMP_FORMATS = new Set<Timestamp['value']['format']>(['t', 'T', 'd', 'D', 'f', 'F', 'R']);
@@ -145,10 +129,6 @@ function stripUrlTrailing(url: string): [string, string] {
 	return [result, url.slice(result.length)];
 }
 
-function isWordChar(ch: string | undefined): boolean {
-	return ch !== undefined && WORD_CHAR_RE.test(ch);
-}
-
 function prevTokenLastChar(stream: TokenStream, pos: number): string | undefined {
 	if (pos === 0) return undefined;
 	return stream.tokenAt(pos - 1)?.image?.slice(-1);
@@ -160,11 +140,9 @@ function prevTokenLastChar(stream: TokenStream, pos: number): string | undefined
 
 function tryMakeBigEmoji(blocks: Array<Paragraph | Blocks>): Root {
 	const emojis: Emoji[] = [];
-
 	for (const block of blocks) {
 		if (block.type === 'LINE_BREAK') continue;
 		if (block.type !== 'PARAGRAPH') return blocks;
-
 		for (const node of block.value) {
 			if (node.type === 'PLAIN_TEXT') {
 				if (node.value.trim() !== '') return blocks;
@@ -176,7 +154,6 @@ function tryMakeBigEmoji(blocks: Array<Paragraph | Blocks>): Root {
 			}
 		}
 	}
-
 	if (emojis.length === 0) return blocks;
 	return [bigEmoji(emojis as BigEmoji['value'])];
 }
@@ -210,26 +187,21 @@ class Parser {
 
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) {
-				let count: number = 0;
+				let count = 0;
 				while (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) {
 					count += this.stream.consume().image.length;
 				}
 				if (blocks.length > 0) {
 					const lastType = blocks[blocks.length - 1]?.type;
-					const trailingNewlineIsBreak: boolean = lastType === 'HEADING' || lastType === 'SPOILER_BLOCK';
-					let breaksToAdd: number;
-					if (trailingNewlineIsBreak) {
-						breaksToAdd = this.stream.isAtEnd() ? count : count - 1 + 1;
-					} else {
-						breaksToAdd = this.stream.isAtEnd() ? 0 : count - 1;
-					}
+					const trailingIsBreak = lastType === 'HEADING' || lastType === 'SPOILER_BLOCK';
+					const breaksToAdd = trailingIsBreak ? (this.stream.isAtEnd() ? count : count) : this.stream.isAtEnd() ? 0 : count - 1;
 					for (let i = 0; i < breaksToAdd; i++) blocks.push(lineBreak());
 				}
 				continue;
 			}
 
 			if ((this.options as any).katex?.parenthesisSyntax && this.stream.check(LiteralBackslash)) {
-				const block: KaTeX | null = this.tryParseBlockKatex();
+				const block = this.tryParseBlockKatex();
 				if (block) {
 					blocks.push(block);
 					continue;
@@ -237,11 +209,11 @@ class Parser {
 			}
 
 			if (this.stream.check(CodeFence)) {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				if (pos === 0 || prevIsNewline) {
-					const block: Code | null = this.tryParseCodeBlock();
+				const pos = this.stream.getPos();
+				const prev = this.stream.tokenAt(pos - 1);
+				const prevNL = prev?.tokenType.name === NewLine.name || prev?.tokenType.name === DoubleNewLine.name;
+				if (pos === 0 || prevNL) {
+					const block = this.tryParseCodeBlock();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -249,38 +221,35 @@ class Parser {
 				}
 			}
 
-			if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('>')) {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				if (pos === 0 || prevIsNewline) {
-					const block: Quote | null = this.tryParseQuote();
+			if (this.stream.check(PlainToken)) {
+				const img = this.stream.peek()!.image;
+				const pos = this.stream.getPos();
+				const prev = this.stream.tokenAt(pos - 1);
+				const prevNL = pos === 0 || prev?.tokenType.name === NewLine.name || prev?.tokenType.name === DoubleNewLine.name;
+
+				if (img.startsWith('>') && prevNL) {
+					const block = this.tryParseQuote();
 					if (block) {
 						blocks.push(block);
 						continue;
 					}
 				}
-			}
-
-			if (this.stream.check(PlainToken) && this.stream.peek()!.image === '||') {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				if (pos === 0 || prevIsNewline) {
-					const block: SpoilerBlock | null = this.tryParseSpoilerBlock();
+				if (img === '||' && prevNL) {
+					const block = this.tryParseSpoilerBlock();
 					if (block) {
 						blocks.push(block);
 						continue;
 					}
 				}
-			}
-
-			if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('- ')) {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				if (pos === 0 || prevIsNewline) {
-					const block: UnorderedList | null = this.tryParseUnorderedList('-');
+				if (img.startsWith('- ') && prevNL) {
+					const block = this.tryParseUnorderedList('-');
+					if (block) {
+						blocks.push(block);
+						continue;
+					}
+				}
+				if (isOrderedListStart(img) && prevNL) {
+					const block = this.tryParseOrderedList();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -289,26 +258,13 @@ class Parser {
 			}
 
 			if (this.stream.checkImage(SpecialChar, '*')) {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				const nextTok: IToken | undefined = this.stream.peekAt(1);
-				const nextIsSpace: boolean = nextTok?.tokenType.name === PlainToken.name && nextTok.image.startsWith(' ');
-				if ((pos === 0 || prevIsNewline) && nextIsSpace) {
-					const block: UnorderedList | null = this.tryParseUnorderedList('*');
-					if (block) {
-						blocks.push(block);
-						continue;
-					}
-				}
-			}
-
-			if (this.stream.check(PlainToken) && ORDERED_LIST_RE.test(this.stream.peek()!.image)) {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				if (pos === 0 || prevIsNewline) {
-					const block: OrderedList | null = this.tryParseOrderedList();
+				const pos = this.stream.getPos();
+				const prev = this.stream.tokenAt(pos - 1);
+				const prevNL = pos === 0 || prev?.tokenType.name === NewLine.name || prev?.tokenType.name === DoubleNewLine.name;
+				const next = this.stream.peekAt(1);
+				const nextIsSpace = next?.tokenType.name === PlainToken.name && next.image.startsWith(' ');
+				if (prevNL && nextIsSpace) {
+					const block = this.tryParseUnorderedList('*');
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -317,11 +273,11 @@ class Parser {
 			}
 
 			if (this.stream.checkImage(SpecialChar, '#')) {
-				const pos: number = this.stream.getPos();
-				const prevTok: IToken | undefined = this.stream.tokenAt(pos - 1);
-				const prevIsNewline: boolean = prevTok?.tokenType.name === NewLine.name || prevTok?.tokenType.name === DoubleNewLine.name;
-				if (pos === 0 || prevIsNewline) {
-					const block: Heading | null = this.tryParseHeading();
+				const pos = this.stream.getPos();
+				const prev = this.stream.tokenAt(pos - 1);
+				const prevNL = pos === 0 || prev?.tokenType.name === NewLine.name || prev?.tokenType.name === DoubleNewLine.name;
+				if (prevNL) {
+					const block = this.tryParseHeading();
 					if (block) {
 						blocks.push(block);
 						continue;
@@ -329,7 +285,7 @@ class Parser {
 				}
 			}
 
-			const para: Paragraph = this.parseParagraph();
+			const para = this.parseParagraph();
 			if (para.value.length > 0) blocks.push(para);
 		}
 
@@ -341,11 +297,10 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseCodeBlock(): Code | null {
-		const savedPos: number = this.stream.getPos();
-		const openTok: IToken = this.stream.consume();
-
-		const rawLang: string = openTok.image.slice(3).trim();
-		const lang: string | undefined = rawLang.length > 0 ? rawLang : undefined;
+		const savedPos = this.stream.getPos();
+		const openTok = this.stream.consume();
+		const rawLang = openTok.image.slice(3).trim();
+		const lang = rawLang.length > 0 ? rawLang : undefined;
 
 		if (!this.stream.match(NewLine)) {
 			this.stream.setPos(savedPos);
@@ -359,32 +314,26 @@ class Parser {
 				this.stream.consume();
 				return code(lines, lang);
 			}
-
 			const lineParts: string[] = [];
+			let alreadyPushed = false;
 
 			while (!this.stream.isAtEnd()) {
 				if (this.stream.check(CodeFence)) break;
-
 				if (this.stream.check(NewLine)) {
 					this.stream.consume();
 					break;
 				}
-
 				if (this.stream.check(DoubleNewLine)) {
 					this.stream.consume();
 					lines.push(codeLine(plain(lineParts.join(''))));
 					lines.push(codeLine(plain('')));
 					lineParts.length = 0;
-					(lineParts as any).__alreadyPushed = true;
+					alreadyPushed = true;
 					break;
 				}
-
 				lineParts.push(this.stream.consume().image);
 			}
-
-			if (!(lineParts as any).__alreadyPushed) {
-				lines.push(codeLine(plain(lineParts.join(''))));
-			}
+			if (!alreadyPushed) lines.push(codeLine(plain(lineParts.join(''))));
 		}
 
 		this.stream.setPos(savedPos);
@@ -396,47 +345,38 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseHeading(): Heading | null {
-		const savedPos: number = this.stream.getPos();
-
-		let level: number = 0;
+		const savedPos = this.stream.getPos();
+		let level = 0;
 		while (this.stream.checkImage(SpecialChar, '#') && level < 4) {
 			this.stream.consume();
 			level++;
 		}
-
-		const next: IToken | undefined = this.stream.peek();
+		const next = this.stream.peek();
 		if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith(' ')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
-		const tok: IToken = this.stream.consume();
-		const text: string = tok.image.slice(1);
-
-		const parts: string[] = [text];
+		const tok = this.stream.consume();
+		const parts = [tok.image.slice(1)];
 		while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 			parts.push(this.stream.consume().image);
 		}
-
 		return heading([plain(parts.join(''))], level as Heading['level']);
 	}
 
 	// ===========================================================================
-	// BLOCK KATEX — \[ ... \]
+	// BLOCK KATEX
 	// ===========================================================================
 
 	private tryParseBlockKatex(): KaTeX | null {
-		const savedPos: number = this.stream.getPos();
-
+		const savedPos = this.stream.getPos();
 		if (!this.stream.check(LiteralBackslash)) return null;
 		this.stream.consume();
-
 		if (!this.stream.checkImage(SpecialChar, '[')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 		this.stream.consume();
-
 		const parts: string[] = [];
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(LiteralBackslash)) {
@@ -450,37 +390,32 @@ class Parser {
 			}
 			parts.push(this.stream.consume().image);
 		}
-
 		this.stream.setPos(savedPos);
 		return null;
 	}
 
 	// ===========================================================================
-	// INLINE KATEX — \(content\)
+	// INLINE KATEX
 	// ===========================================================================
 
 	private tryParseInlineKatex(): InlineKaTeX | null {
-		const savedPos: number = this.stream.getPos();
-
+		const savedPos = this.stream.getPos();
 		this.stream.consume();
-
-		const next: IToken | undefined = this.stream.peek();
+		const next = this.stream.peek();
 		if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith('(')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 		this.stream.consume();
-		const afterParen: string = next.image.slice(1);
-
-		const parts: string[] = [afterParen];
+		const parts = [next.image.slice(1)];
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(NewLine) || this.stream.check(DoubleNewLine)) break;
 			if (this.stream.check(LiteralBackslash)) {
 				this.stream.consume();
-				const t: IToken | undefined = this.stream.peek();
+				const t = this.stream.peek();
 				if (t && t.tokenType.name === PlainToken.name && t.image.startsWith(')')) {
 					this.stream.consume();
-					const leftover: string = t.image.slice(1);
+					const leftover = t.image.slice(1);
 					if (leftover) this.pending.push(plain(leftover));
 					return inlineKatex(parts.join(''));
 				}
@@ -489,7 +424,6 @@ class Parser {
 			}
 			parts.push(this.stream.consume().image);
 		}
-
 		this.stream.setPos(savedPos);
 		return null;
 	}
@@ -499,36 +433,28 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseQuote(): Quote | null {
-		const savedPos: number = this.stream.getPos();
+		const savedPos = this.stream.getPos();
 		const paragraphs: Paragraph[] = [];
 
 		while (!this.stream.isAtEnd()) {
 			if (!this.stream.check(PlainToken) || !this.stream.peek()!.image.startsWith('>')) break;
-
-			const tok: IToken = this.stream.consume();
-			let line: string = tok.image.slice(1);
+			const tok = this.stream.consume();
+			let line = tok.image.slice(1);
 			if (line.startsWith(' ')) line = line.slice(1);
 
-			const lineParts: string[] = [line];
+			const lineParts = [line];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-
-			const lineInlines: Inlines[] = this.parseQuoteLine(lineParts.join(''));
-			paragraphs.push(paragraph(reducePlainTexts(lineInlines)));
-
-			if (this.stream.check(NewLine)) {
-				this.stream.consume();
-			} else {
-				break;
-			}
+			paragraphs.push(paragraph(reducePlainTexts(this.parseQuoteLine(lineParts.join('')))));
+			if (this.stream.check(NewLine)) this.stream.consume();
+			else break;
 		}
 
 		if (paragraphs.length === 0) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
 		return quote(paragraphs);
 	}
 
@@ -536,17 +462,15 @@ class Parser {
 		const { tokens, errors } = MessageLexer.tokenize(text);
 		if (errors.length > 0) return [plain(text)];
 		if (tokens.length === 0) return [plain('')];
-		const subStream = new TokenStream(tokens);
-		const subParser = new Parser(subStream, this.options);
-		const inlines: Inlines[] = subParser.parseParagraphInlines();
-		return reducePlainTexts(inlines) as Inlines[];
+		const sub = new Parser(new TokenStream(tokens), this.options);
+		return reducePlainTexts(sub.parseParagraphInlines()) as Inlines[];
 	}
 
 	parseParagraphInlines(): Inlines[] {
 		const inlines: Inlines[] = [];
 		while (!this.stream.isAtEnd() || this.pending.length > 0) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-			const node: Inlines | null = this.nextInline({});
+			const node = this.nextInline({});
 			if (node) inlines.push(node);
 		}
 		return inlines;
@@ -557,11 +481,9 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseSpoilerBlock(): SpoilerBlock | null {
-		const savedPos: number = this.stream.getPos();
-
+		const savedPos = this.stream.getPos();
 		if (!this.stream.check(PlainToken) || this.stream.peek()!.image !== '||') return null;
 		this.stream.consume();
-
 		if (!this.stream.check(NewLine)) {
 			this.stream.setPos(savedPos);
 			return null;
@@ -569,27 +491,19 @@ class Parser {
 		this.stream.consume();
 
 		const paragraphs: Paragraph[] = [];
-
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(PlainToken) && this.stream.peek()!.image === '||') {
 				this.stream.consume();
 				return spoilerBlock(paragraphs);
 			}
-
 			const lineParts: string[] = [];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-			const inlines: Inlines[] = this.parseQuoteLine(lineParts.join(''));
-			paragraphs.push(paragraph(reducePlainTexts(inlines)));
-
-			if (this.stream.check(NewLine)) {
-				this.stream.consume();
-			} else if (this.stream.check(DoubleNewLine)) {
-				break;
-			}
+			paragraphs.push(paragraph(reducePlainTexts(this.parseQuoteLine(lineParts.join('')))));
+			if (this.stream.check(NewLine)) this.stream.consume();
+			else if (this.stream.check(DoubleNewLine)) break;
 		}
-
 		this.stream.setPos(savedPos);
 		return null;
 	}
@@ -599,45 +513,34 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseUnorderedList(marker: '-' | '*'): UnorderedList | null {
-		const savedPos: number = this.stream.getPos();
+		const savedPos = this.stream.getPos();
 		const items: ListItem[] = [];
 
 		while (!this.stream.isAtEnd()) {
 			let lineText: string;
-
 			if (marker === '-') {
 				if (!this.stream.check(PlainToken) || !this.stream.peek()!.image.startsWith('- ')) break;
-				const tok: IToken = this.stream.consume();
-				lineText = tok.image.slice(2);
+				lineText = this.stream.consume().image.slice(2);
 			} else {
 				if (!this.stream.checkImage(SpecialChar, '*')) break;
-				const nextTok: IToken | undefined = this.stream.peekAt(1);
-				if (!nextTok || nextTok.tokenType.name !== PlainToken.name || !nextTok.image.startsWith(' ')) break;
+				const next = this.stream.peekAt(1);
+				if (!next || next.tokenType.name !== PlainToken.name || !next.image.startsWith(' ')) break;
 				this.stream.consume();
-				const tok: IToken = this.stream.consume();
-				lineText = tok.image.slice(1);
+				lineText = this.stream.consume().image.slice(1);
 			}
-
-			const lineParts: string[] = [lineText];
+			const lineParts = [lineText];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-
-			const inlines: Inlines[] = this.parseQuoteLine(lineParts.join(''));
-			items.push(listItem(inlines));
-
-			if (this.stream.check(NewLine)) {
-				this.stream.consume();
-			} else {
-				break;
-			}
+			items.push(listItem(this.parseQuoteLine(lineParts.join(''))));
+			if (this.stream.check(NewLine)) this.stream.consume();
+			else break;
 		}
 
 		if (items.length === 0) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
 		return unorderedList(items);
 	}
 
@@ -646,52 +549,39 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseOrderedList(): OrderedList | null {
-		const savedPos: number = this.stream.getPos();
+		const savedPos = this.stream.getPos();
 		const items: ListItem[] = [];
 
 		while (!this.stream.isAtEnd()) {
 			if (!this.stream.check(PlainToken)) break;
-			const tok: IToken = this.stream.peek()!;
-			const m: RegExpMatchArray | null = tok.image.match(ORDERED_LIST_ITEM_RE);
+			const tok = this.stream.peek()!;
+			const m = matchOrderedListItem(tok.image);
 			if (!m) break;
-
 			this.stream.consume();
-			const num: number = parseInt(m[1], 10);
-			let lineText: string = m[2];
-
-			const lineParts: string[] = [lineText];
+			const [num, firstLine] = m;
+			const lineParts = [firstLine];
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-			lineText = lineParts.join('');
-
-			const inlines: Inlines[] = this.parseQuoteLine(lineText);
-			items.push(listItem(inlines, num));
-
-			if (this.stream.check(NewLine)) {
-				this.stream.consume();
-			} else {
-				break;
-			}
+			items.push(listItem(this.parseQuoteLine(lineParts.join('')), num));
+			if (this.stream.check(NewLine)) this.stream.consume();
+			else break;
 		}
 
 		if (items.length === 0) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
 		return orderedList(items);
 	}
 
 	private parseParagraph(): Paragraph {
 		const inlines: Inlines[] = [];
-
 		while (!this.stream.isAtEnd() || this.pending.length > 0) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-			const node: Inlines | null = this.nextInline({});
+			const node = this.nextInline({});
 			if (node) inlines.push(node);
 		}
-
 		return paragraph(reducePlainTexts(inlines));
 	}
 
@@ -709,11 +599,11 @@ class Parser {
 
 		if (this.stream.check(LiteralBackslash)) {
 			if ((this.options as any).katex?.parenthesisSyntax) {
-				const node: InlineKaTeX | null = this.tryParseInlineKatex();
+				const node = this.tryParseInlineKatex();
 				if (node) return node;
 			}
-			const bsImage: string = this.stream.consume().image;
-			const next: IToken | undefined = this.stream.peek();
+			const bsImage = this.stream.consume().image;
+			const next = this.stream.peek();
 			if (next && next.tokenType.name === SpecialChar.name) {
 				return plain(bsImage + this.stream.consume().image);
 			}
@@ -721,22 +611,19 @@ class Parser {
 		}
 
 		if (this.stream.checkImage(SpecialChar, '*') && !ctx.inBold) {
-			const node: Bold | null = this.tryParseFormatting('*', ctx);
+			const node = this.tryParseFormatting('*', ctx);
 			if (node) return node;
 		}
-
 		if (this.stream.checkImage(SpecialChar, '_') && !ctx.inItalic) {
-			const node: Italic | null = this.tryParseItalic(ctx);
+			const node = this.tryParseItalic(ctx);
 			if (node) return node;
 		}
-
 		if (this.stream.checkImage(SpecialChar, '~') && !ctx.inStrike) {
-			const node: Strike | null = this.tryParseFormatting('~', ctx);
+			const node = this.tryParseFormatting('~', ctx);
 			if (node) return node;
 		}
-
 		if (this.stream.checkImage(SpecialChar, '`')) {
-			const node: InlineCode | null = this.tryParseInlineCode();
+			const node = this.tryParseInlineCode();
 			if (node) return node;
 		}
 
@@ -746,17 +633,16 @@ class Parser {
 			this.stream.peekAt(1)?.tokenType.name === SpecialChar.name &&
 			this.stream.peekAt(1)?.image === '['
 		) {
-			const node: Image | Plain | null = this.tryParseImage(ctx);
+			const node = this.tryParseImage(ctx);
 			if (node) return node;
 		}
 
 		if (this.stream.checkImage(SpecialChar, '[')) {
-			const node: Link | null = this.tryParseLink(ctx);
+			const node = this.tryParseLink(ctx);
 			if (node) return node;
 		}
-
 		if (this.stream.checkImage(SpecialChar, '#')) {
-			const node: ChannelMention | null = this.tryParseChannelMention();
+			const node = this.tryParseChannelMention();
 			if (node) return node;
 		}
 
@@ -764,91 +650,72 @@ class Parser {
 		if (this.stream.check(UrlToken)) return this.parseUrlToken();
 		if (this.stream.check(PhoneToken)) return this.parsePhoneToken();
 
-		if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('||')) {
-			const node: Spoiler | null = this.tryParseInlineSpoiler();
-			if (node) return node;
+		if (this.stream.check(PlainToken)) {
+			const img = this.stream.peek()!.image;
+			if (img.startsWith('||')) {
+				const node = this.tryParseInlineSpoiler();
+				if (node) return node;
+			}
+			if (img === 'color:') {
+				const node = this.tryParseColor();
+				if (node) return node;
+			}
+			return this.parsePlainToken(ctx);
 		}
-
-		if (this.stream.check(PlainToken) && this.stream.peek()!.image === 'color:') {
-			const node: Color | Plain | null = this.tryParseColor();
-			if (node) return node;
-		}
-
-		if (this.stream.check(PlainToken)) return this.parsePlainToken(ctx);
 
 		if (this.stream.check(CodeFence)) return plain(this.stream.consume().image);
-
 		return this.parseFallback();
 	}
 
 	// ===========================================================================
-	// EMAIL TOKEN
+	// TOKEN PARSERS
 	// ===========================================================================
 
 	private parseEmailToken(): Link | Plain {
-		const tok: IToken = this.stream.consume();
-		const address: string = tok.image.startsWith('mailto:') ? tok.image.slice(7) : tok.image;
+		const tok = this.stream.consume();
+		const address = tok.image.startsWith('mailto:') ? tok.image.slice(7) : tok.image;
 		return autoEmail(address);
 	}
 
-	// ===========================================================================
-	// URL TOKEN
-	// ===========================================================================
-
 	private parseUrlToken(): Link | Plain {
-		const tok: IToken = this.stream.consume();
-
-		const prevChar: string | undefined = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
-		if (WORD_CHAR_WITH_DOT_RE.test(prevChar ?? '')) {
-			return plain(tok.image);
-		}
-
-		const [stripped, leftover]: [string, string] = stripUrlTrailing(tok.image);
+		const tok = this.stream.consume();
+		const prevChar = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
+		if (isWordCharWithDot(prevChar)) return plain(tok.image);
+		const [stripped, leftover] = stripUrlTrailing(tok.image);
 		if (leftover) this.pending.push(plain(leftover));
 		return autoLink(stripped, this.options.customDomains);
 	}
 
-	// ===========================================================================
-	// PHONE TOKEN
-	// ===========================================================================
-
 	private parsePhoneToken(): Link | Plain {
-		const tok: IToken = this.stream.consume();
-
-		const prevChar: string | undefined = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
-		if (GENERIC_WORD_CHAR_RE.test(prevChar ?? '')) return plain(tok.image);
-
-		return phoneChecker(tok.image, tok.image.replace(NON_DIGIT_RE, ''));
+		const tok = this.stream.consume();
+		const prevChar = prevTokenLastChar(this.stream, this.stream.getPos() - 1);
+		if (isGenericWordChar(prevChar)) return plain(tok.image);
+		return phoneChecker(tok.image, stripNonDigits(tok.image));
 	}
 
 	// ===========================================================================
-	// #CHANNEL MENTION
+	// CHANNEL MENTION
 	// ===========================================================================
 
 	private tryParseChannelMention(): ChannelMention | null {
-		const savedPos: number = this.stream.getPos();
-
-		const prevChar: string | undefined = prevTokenLastChar(this.stream, savedPos);
-		if (isWordChar(prevChar)) return null;
-		if (prevChar === '#') return null;
-		if (prevChar === ':') return null;
-		if (prevChar === '@') return null;
-
-		const prevTokImage: string | undefined = this.stream.getPos() > 0 ? this.stream.tokenAt(this.stream.getPos() - 1)?.image : undefined;
-		if (prevTokImage === 'color:') return null;
+		const savedPos = this.stream.getPos();
+		const prevChar = prevTokenLastChar(this.stream, savedPos);
+		if (isWordChar(prevChar) || prevChar === '#' || prevChar === ':' || prevChar === '@') return null;
+		const prevImg = savedPos > 0 ? this.stream.tokenAt(savedPos - 1)?.image : undefined;
+		if (prevImg === 'color:') return null;
 
 		this.stream.consume();
-
 		if (this.stream.checkImage(SpecialChar, '#')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 
-		const tok: IToken | undefined = this.stream.peek();
-		if (tok?.tokenType.name === PlainToken.name && NON_SPACE_START_RE.test(tok.image)) {
+		const tok = this.stream.peek();
+		if (tok?.tokenType.name === PlainToken.name && isNonSpaceStart(tok.image)) {
 			this.stream.consume();
-			const name: string = tok.image.split(' ')[0];
-			const rest: string = tok.image.slice(name.length);
+			const spaceIdx = tok.image.indexOf(' ');
+			const name = spaceIdx === -1 ? tok.image : tok.image.slice(0, spaceIdx);
+			const rest = tok.image.slice(name.length);
 			if (rest) this.pending.push(plain(rest));
 			return mentionChannel(name);
 		}
@@ -864,10 +731,9 @@ class Parser {
 	private tryParseFormatting(delim: '*', ctx: FormattingContext): Bold | null;
 	private tryParseFormatting(delim: '~', ctx: FormattingContext): Strike | null;
 	private tryParseFormatting(delim: '*' | '~', ctx: FormattingContext): Bold | Strike | null {
-		const savedPos: number = this.stream.getPos();
-
+		const savedPos = this.stream.getPos();
 		this.stream.consume();
-		const isDouble: boolean = this.stream.checkImage(SpecialChar, delim);
+		const isDouble = this.stream.checkImage(SpecialChar, delim);
 		if (isDouble) this.stream.consume();
 
 		const innerCtx: FormattingContext = {
@@ -875,16 +741,15 @@ class Parser {
 			inBold: delim === '*' ? true : ctx.inBold,
 			inStrike: delim === '~' ? true : ctx.inStrike,
 		};
-
 		const inner: Inlines[] = [];
-		let closed: boolean = false;
+		let closed = false;
 
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
 
 			if (this.stream.checkImage(SpecialChar, delim)) {
 				this.stream.consume();
-				const closingDouble: boolean = this.stream.checkImage(SpecialChar, delim);
+				const closingDouble = this.stream.checkImage(SpecialChar, delim);
 
 				if (isDouble && closingDouble) {
 					this.stream.consume();
@@ -892,23 +757,20 @@ class Parser {
 					break;
 				} else if (isDouble && !closingDouble) {
 					this.stream.setPos(savedPos + 1);
-					const single: Bold | Strike | null = this.tryParseFormatting(delim as any, ctx);
+					const single = this.tryParseFormatting(delim as any, ctx);
 					if (single) {
 						this.pending.unshift(single);
 						return plain(delim) as any;
 					}
 					this.stream.setPos(savedPos);
 					return null;
-				} else if (!isDouble && closingDouble) {
-					closed = true;
-					break;
 				} else {
 					closed = true;
 					break;
 				}
 			}
 
-			const node: Inlines | null = this.nextInline(innerCtx);
+			const node = this.nextInline(innerCtx);
 			if (node) inner.push(node);
 		}
 
@@ -916,8 +778,7 @@ class Parser {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
-		const allWS: boolean = inner.every((n) => n.type === 'PLAIN_TEXT' && (n as Plain).value.trim() === '');
+		const allWS = inner.every((n) => n.type === 'PLAIN_TEXT' && (n as Plain).value.trim() === '');
 		if (allWS) {
 			this.stream.setPos(savedPos);
 			return null;
@@ -932,32 +793,31 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseItalic(ctx: FormattingContext): Italic | null {
-		const savedPos: number = this.stream.getPos();
-
-		const prevChar: string | undefined = prevTokenLastChar(this.stream, savedPos);
+		const savedPos = this.stream.getPos();
+		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar)) return null;
 
 		this.stream.consume();
-		const isDouble: boolean = this.stream.checkImage(SpecialChar, '_');
+		const isDouble = this.stream.checkImage(SpecialChar, '_');
 		if (isDouble) this.stream.consume();
 
 		const innerCtx: FormattingContext = { ...ctx, inItalic: true };
 		const inner: Inlines[] = [];
-		let closed: boolean = false;
+		let closed = false;
 
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
 
 			if (this.stream.checkImage(SpecialChar, '_')) {
-				const p: number = this.stream.getPos();
+				const p = this.stream.getPos();
 				this.stream.consume();
-				const closingDouble: boolean = this.stream.checkImage(SpecialChar, '_');
-				const nextChar: string | undefined = this.stream.peek()?.image?.[0];
+				const closingDouble = this.stream.checkImage(SpecialChar, '_');
+				const nextChar = this.stream.peek()?.image?.[0];
 
 				if (isDouble && closingDouble) {
 					if (isWordChar(nextChar)) {
 						this.stream.setPos(p);
-						const node: Inlines | null = this.nextInline(innerCtx);
+						const node = this.nextInline(innerCtx);
 						if (node) inner.push(node);
 						continue;
 					}
@@ -967,25 +827,18 @@ class Parser {
 				} else if (isDouble && !closingDouble) {
 					if (isWordChar(nextChar)) {
 						this.stream.setPos(p);
-						const node: Inlines | null = this.nextInline(innerCtx);
+						const node = this.nextInline(innerCtx);
 						if (node) inner.push(node);
 						continue;
 					}
 					this.stream.setPos(savedPos + 1);
-					const single: Italic | null = this.tryParseItalic(ctx);
+					const single = this.tryParseItalic(ctx);
 					if (single) {
 						this.pending.unshift(single);
 						return plain('_') as any;
 					}
 					this.stream.setPos(savedPos);
 					return null;
-				} else if (!isDouble && closingDouble) {
-					if (isWordChar(nextChar)) {
-						this.stream.setPos(savedPos);
-						return null;
-					}
-					closed = true;
-					break;
 				} else {
 					if (isWordChar(nextChar)) {
 						this.stream.setPos(savedPos);
@@ -996,7 +849,7 @@ class Parser {
 				}
 			}
 
-			const node: Inlines | null = this.nextInline(innerCtx);
+			const node = this.nextInline(innerCtx);
 			if (node) inner.push(node);
 		}
 
@@ -1004,69 +857,57 @@ class Parser {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
-		const allWS: boolean = inner.every((n) => n.type === 'PLAIN_TEXT' && (n as Plain).value.trim() === '');
+		const allWS = inner.every((n) => n.type === 'PLAIN_TEXT' && (n as Plain).value.trim() === '');
 		if (allWS) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
 		return italic(reducePlainTexts(inner) as Italic['value']);
 	}
 
 	// ===========================================================================
-	// IMAGE — ![label](url)
+	// IMAGE & LINK
 	// ===========================================================================
 
 	private tryParseImage(ctx: FormattingContext): Image | Plain | null {
-		const savedPos: number = this.stream.getPos();
-
-		const plainTok: IToken = this.stream.consume();
-		const prefix: string = plainTok.image.slice(0, -1);
-
+		const savedPos = this.stream.getPos();
+		const plainTok = this.stream.consume();
+		const prefix = plainTok.image.slice(0, -1);
 		this.stream.consume();
 
-		const labelNodes: Inlines[] = this.parseLinkLabel(ctx);
-
+		const labelNodes = this.parseLinkLabel(ctx);
 		if (!this.stream.matchImage(SpecialChar, ']')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
-		const urlRaw: string | null = this.parseLinkUrl();
+		const urlRaw = this.parseLinkUrl();
 		if (urlRaw === null) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 
-		const label: Markup | undefined = labelNodes.length > 0 ? (reducePlainTexts(labelNodes)[0] as Markup) : undefined;
-		const imgNode: Image = image(urlRaw, label);
-
+		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes)[0] as Markup) : undefined;
+		const imgNode = image(urlRaw, label);
 		if (prefix.length > 0) {
 			this.pending.push(imgNode);
 			return plain(prefix);
 		}
-
 		return imgNode;
 	}
 
 	private tryParseLink(ctx: FormattingContext): Link | null {
-		const savedPos: number = this.stream.getPos();
+		const savedPos = this.stream.getPos();
 		this.stream.consume();
-
-		const labelNodes: Inlines[] = this.parseLinkLabel(ctx);
-
+		const labelNodes = this.parseLinkLabel(ctx);
 		if (!this.stream.matchImage(SpecialChar, ']')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
-		const urlRaw: string | null = this.parseLinkUrl();
+		const urlRaw = this.parseLinkUrl();
 		if (urlRaw === null) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
-
 		return this.resolveLinkUrl(urlRaw, labelNodes);
 	}
 
@@ -1075,20 +916,20 @@ class Parser {
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.checkImage(SpecialChar, ']')) break;
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-			const node: Inlines | null = this.parseInline(ctx);
+			const node = this.parseInline(ctx);
 			if (node) nodes.push(node);
 		}
 		return nodes;
 	}
 
 	private parseLinkUrl(): string | null {
-		const tok: IToken | undefined = this.stream.peek();
+		const tok = this.stream.peek();
 		if (!tok?.image.startsWith('(')) return null;
 		this.stream.consume();
-		let raw: string = tok.image.slice(1);
+		let raw = tok.image.slice(1);
 		if (raw.endsWith(')')) return raw.slice(0, -1);
 		while (!this.stream.isAtEnd()) {
-			const t: IToken = this.stream.consume();
+			const t = this.stream.consume();
 			if (t.image.endsWith(')')) {
 				raw += t.image.slice(0, -1);
 				return raw;
@@ -1099,10 +940,9 @@ class Parser {
 	}
 
 	private resolveLinkUrl(urlRaw: string, labelNodes: Inlines[]): Link {
-		const label: Markup[] | undefined = labelNodes.length > 0 ? (reducePlainTexts(labelNodes) as Markup[]) : undefined;
-
-		if (PHONE_URL_RE.test(urlRaw)) {
-			const digits: string = urlRaw.replace(NON_DIGIT_RE, '');
+		const label = labelNodes.length > 0 ? (reducePlainTexts(labelNodes) as Markup[]) : undefined;
+		if (isPhoneUrl(urlRaw)) {
+			const digits = stripNonDigits(urlRaw);
 			if (digits.length >= 5) return link(`tel:${digits}`, label ?? [plain(urlRaw)]);
 		}
 		return link(urlRaw, label);
@@ -1113,56 +953,52 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseInlineSpoiler(): Spoiler | null {
-		const savedPos: number = this.stream.getPos();
-		const tok: IToken = this.stream.peek()!;
-		const afterOpen: string = tok.image.slice(2);
-
+		const savedPos = this.stream.getPos();
+		const tok = this.stream.peek()!;
+		const afterOpen = tok.image.slice(2);
 		if (tok.image === '||||') return null;
-
 		this.stream.consume();
 
-		const closeIdx: number = afterOpen.indexOf('||');
+		const closeIdx = afterOpen.indexOf('||');
 		if (closeIdx !== -1) {
-			const innerText: string = afterOpen.slice(0, closeIdx);
-			const rest: string = afterOpen.slice(closeIdx + 2);
+			const innerText = afterOpen.slice(0, closeIdx);
+			const rest = afterOpen.slice(closeIdx + 2);
 			if (innerText.length === 0) {
 				this.stream.setPos(savedPos);
 				return null;
 			}
-			const inner: Inlines[] = this.parseQuoteLine(innerText);
+			const inner = this.parseQuoteLine(innerText);
 			if (rest.length > 0) this.pendingFromText(rest);
 			return spoiler(inner as Spoiler['value']);
 		}
 
-		const parts: string[] = [afterOpen];
-
+		const parts = [afterOpen];
 		while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 			if (this.stream.check(PlainToken)) {
-				const t: IToken = this.stream.peek()!;
-				const ci: number = t.image.indexOf('||');
+				const t = this.stream.peek()!;
+				const ci = t.image.indexOf('||');
 				if (ci !== -1) {
 					parts.push(t.image.slice(0, ci));
-					const rest: string = t.image.slice(ci + 2);
+					const rest = t.image.slice(ci + 2);
+					const innerText = parts.join('');
 					this.stream.consume();
-					const innerText: string = parts.join('');
 					if (innerText.length === 0) {
 						this.stream.setPos(savedPos);
 						return null;
 					}
-					const inner: Inlines[] = this.parseQuoteLine(innerText);
+					const inner = this.parseQuoteLine(innerText);
 					if (rest.length > 0) this.pendingFromText(rest);
 					return spoiler(inner as Spoiler['value']);
 				}
 			}
 			parts.push(this.stream.consume().image);
 		}
-
 		this.stream.setPos(savedPos);
 		return null;
 	}
 
 	private pendingFromText(text: string): void {
-		if (text.length === 0) return;
+		if (!text) return;
 		const { tokens, errors } = MessageLexer.tokenize(text);
 		if (errors.length > 0 || tokens.length === 0) {
 			this.pending.push(plain(text));
@@ -1176,61 +1012,59 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseColor(): Color | Plain | null {
-		const savedPos: number = this.stream.getPos();
-
+		const savedPos = this.stream.getPos();
 		this.stream.consume();
-
 		if (!this.stream.checkImage(SpecialChar, '#')) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 		this.stream.consume();
 
-		const hexTok: IToken | undefined = this.stream.peek();
+		const hexTok = this.stream.peek();
 		if (!hexTok || hexTok.tokenType.name !== PlainToken.name) {
 			this.stream.setPos(savedPos);
 			return null;
 		}
 
-		const hex: string = hexTok.image;
-		const validLen: boolean = hex.length === 3 || hex.length === 4 || hex.length === 6 || hex.length === 8;
-		const validChars: boolean = HEX_COLOR_RE.test(hex);
-
-		if (!validLen || !validChars) {
+		const hex = hexTok.image;
+		const validLen = hex.length === 3 || hex.length === 4 || hex.length === 6 || hex.length === 8;
+		if (!validLen || !isValidHexString(hex)) {
 			this.stream.consume();
 			this.pending.push(plain('#' + hex));
 			return plain('color:');
 		}
 		this.stream.consume();
 
-		let r: number = 0,
-			g: number = 0,
-			b: number = 0,
-			a: number = 255;
+		function hb(s: string, start: number, expand: boolean): number {
+			const n = s.slice(start, start + (expand ? 1 : 2));
+			return expand ? parseInt(n + n, 16) : parseInt(n, 16);
+		}
+
+		let r = 0,
+			g = 0,
+			b = 0,
+			a = 255;
 		if (hex.length === 3) {
-			r = parseInt(hex[0] + hex[0], 16);
-			g = parseInt(hex[1] + hex[1], 16);
-			b = parseInt(hex[2] + hex[2], 16);
+			r = hb(hex, 0, true);
+			g = hb(hex, 1, true);
+			b = hb(hex, 2, true);
 		} else if (hex.length === 4) {
-			r = parseInt(hex[0] + hex[0], 16);
-			g = parseInt(hex[1] + hex[1], 16);
-			b = parseInt(hex[2] + hex[2], 16);
-			a = parseInt(hex[3] + hex[3], 16);
+			r = hb(hex, 0, true);
+			g = hb(hex, 1, true);
+			b = hb(hex, 2, true);
+			a = hb(hex, 3, true);
 		} else if (hex.length === 6) {
-			r = parseInt(hex.slice(0, 2), 16);
-			g = parseInt(hex.slice(2, 4), 16);
-			b = parseInt(hex.slice(4, 6), 16);
+			r = hb(hex, 0, false);
+			g = hb(hex, 2, false);
+			b = hb(hex, 4, false);
 		} else {
-			r = parseInt(hex.slice(0, 2), 16);
-			g = parseInt(hex.slice(2, 4), 16);
-			b = parseInt(hex.slice(4, 6), 16);
-			a = parseInt(hex.slice(6, 8), 16);
+			r = hb(hex, 0, false);
+			g = hb(hex, 2, false);
+			b = hb(hex, 4, false);
+			a = hb(hex, 6, false);
 		}
 
-		if (!(this.options as any).colors) {
-			return plain('color:#' + hex);
-		}
-
+		if (!(this.options as any).colors) return plain('color:#' + hex);
 		return color(r, g, b, a);
 	}
 
@@ -1239,40 +1073,26 @@ class Parser {
 	// ===========================================================================
 
 	private parseTimestampTag(raw: string): Timestamp | null {
-		const inner: string = raw.slice(3, -1);
-
-		let value: string = inner;
-		let format: string = 't';
-
-		const lastColon: number = inner.lastIndexOf(':');
-		if (lastColon !== -1) {
-			const candidate: string = inner.slice(lastColon + 1);
-			if (candidate.length === 1 && ALPHA_RE.test(candidate)) {
-				format = candidate;
-				value = inner.slice(0, lastColon);
-			}
-		}
-
+		const parts = parseTimestampTagParts(raw);
+		if (!parts) return null;
+		const { value, format } = parts;
 		if (!VALID_TIMESTAMP_FORMATS.has(format as Timestamp['value']['format'])) return null;
 
 		let unixSeconds: number;
-
-		if (TIMESTAMP_EPOCH_RE.test(value)) {
+		if (isEpochString(value)) {
 			if (value.length < 5) return null;
 			unixSeconds = parseInt(value, 10);
 		} else if (value.includes('T')) {
-			const ms: number = Date.parse(value);
+			const ms = Date.parse(value);
 			if (isNaN(ms)) return null;
 			unixSeconds = Math.floor(ms / 1000);
 		} else {
-			const m: RegExpMatchArray | null = value.match(TIMESTAMP_RELATIVE_RE);
+			const m = parseRelativeTimestamp(value);
 			if (!m) return null;
-
-			const tsStr: string = timestampFromHours(m[1], m[2], m[3] ?? '00', m[4]);
+			const tsStr = timestampFromHours(m[0], m[1], m[2], m[3]);
 			unixSeconds = parseInt(tsStr, 10);
 			if (isNaN(unixSeconds)) return null;
 		}
-
 		return timestamp(String(unixSeconds), format as Timestamp['value']['format']);
 	}
 
@@ -1281,166 +1101,119 @@ class Parser {
 	// ===========================================================================
 
 	private parsePlainToken(_ctx: FormattingContext = {}): Inlines {
-		let text: string = this.stream.consume().image;
+		let text = this.stream.consume().image;
 
+		// Absorb underscore-joined word segments (snake_case protection)
 		while (
 			this.stream.checkImage(SpecialChar, '_') &&
 			((this.stream.peekAt(1)?.tokenType.name === PlainToken.name &&
-				NON_SPACE_START_RE.test(this.stream.peekAt(1)!.image) &&
+				isNonSpaceStart(this.stream.peekAt(1)!.image) &&
 				!this.stream.peekAt(1)!.image.startsWith('_')) ||
 				this.stream.peekAt(1)?.tokenType.name === EmailToken.name) &&
-			WORD_CHAR_RE.test(text.slice(-1))
+			isWordChar(text.slice(-1))
 		) {
 			text += this.stream.consume().image;
 			text += this.stream.consume().image;
 		}
-
-		while (this.stream.check(EmailToken) && this.stream.peek()!.image.startsWith('_') && WORD_CHAR_RE.test(text.slice(-1))) {
+		while (this.stream.check(EmailToken) && this.stream.peek()!.image.startsWith('_') && isWordChar(text.slice(-1))) {
 			text += this.stream.consume().image;
 		}
-
 		while (text.endsWith('@') && this.stream.check(EmailToken)) {
 			text += this.stream.consume().image;
 		}
 
-		_emailRe.lastIndex = 0;
-		const emailMatch: RegExpExecArray | null = text.startsWith('@') ? null : _emailRe.exec(text);
-		if (emailMatch) {
-			const before: string = text.slice(0, emailMatch.index);
-			const matchedEmail: string = emailMatch[0];
-			const after: string = text.slice(emailMatch.index + matchedEmail.length);
-			const address: string = matchedEmail.startsWith('mailto:') ? matchedEmail.slice(7) : matchedEmail;
-			const emailNode: Link | Plain = autoEmail(address);
-			if (emailNode.type !== 'PLAIN_TEXT') {
-				if (after.length > 0) {
-					const afterNodes: Inlines[] = this.splitPlainText(after, _ctx.inBold);
-					this.pending.unshift(emailNode, ...afterNodes);
-				} else {
-					this.pending.unshift(emailNode);
+		// Fast email detection with '@' pre-check
+		if (!text.startsWith('@') && text.includes('@')) {
+			const emailResult = findEmailInText(text, 0);
+			if (emailResult) {
+				const [emailIdx, matchedEmail] = emailResult;
+				const before = text.slice(0, emailIdx);
+				const after = text.slice(emailIdx + matchedEmail.length);
+				const address = matchedEmail.startsWith('mailto:') ? matchedEmail.slice(7) : matchedEmail;
+				const emailNode = autoEmail(address);
+				if (emailNode.type !== 'PLAIN_TEXT') {
+					if (after.length > 0) {
+						const afterNodes = this.splitPlainText(after, _ctx.inBold);
+						this.pending.unshift(emailNode, ...afterNodes);
+					} else {
+						this.pending.unshift(emailNode);
+					}
+					if (before.length > 0) return plain(before);
+					return this.pending.shift()!;
 				}
-				if (before.length > 0) return plain(before);
-				return this.pending.shift()!;
 			}
 		}
 
-		const nodes: Inlines[] = this.splitPlainText(text, _ctx.inBold);
+		const nodes = this.splitPlainText(text, _ctx.inBold);
 		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
 		return nodes[0];
 	}
 
 	// ===========================================================================
-	// SPLIT PLAIN TEXT
+	// SPLIT PLAIN TEXT  — single-pass via scanPlainText()
 	// ===========================================================================
 
 	private splitPlainText(text: string, noTimestamp: boolean = false): Inlines[] {
 		const results: Inlines[] = [];
-		let remaining: string = text;
-		let prevChar: string = '';
+		let remaining = text;
+		let prevChar = '';
 
 		while (remaining.length > 0) {
-			if (!noTimestamp) {
-				const tsMatch: RegExpMatchArray | null = remaining.match(TIMESTAMP_INLINE_RE);
-				if (tsMatch && tsMatch.index !== undefined) {
-					if (tsMatch.index > 0) results.push(plain(remaining.slice(0, tsMatch.index)));
-					const tsNode: Timestamp | null = this.parseTimestampTag(tsMatch[0]);
-					results.push(tsNode ?? plain(tsMatch[0]));
-					prevChar = '>';
-					remaining = remaining.slice(tsMatch.index + tsMatch[0].length);
-					continue;
-				}
-			}
+			// Single call finds the earliest of all pattern types in one pass
+			const hit: ScanHit | null = scanPlainText(remaining, prevChar, noTimestamp, !!this.options.emoticons, EMOTICON_LIST);
 
-			const mentionMatch: RegExpMatchArray | null = remaining.match(MENTION_USER_RE);
-			let mentionIdx: number = mentionMatch?.index ?? Infinity;
-			if (mentionMatch && mentionIdx !== Infinity) {
-				const cb: string = mentionIdx > 0 ? remaining[mentionIdx - 1] : prevChar;
-				if (WORD_CHAR_RE.test(cb)) mentionIdx = Infinity;
-			}
-
-			let emojiIdx: number = Infinity;
-			let emojiMatch: RegExpMatchArray | null = null;
-			_emojiCodeRe.lastIndex = 0;
-			let em: RegExpMatchArray | null;
-			while ((em = _emojiCodeRe.exec(remaining)) !== null) {
-				const before: string = em.index! > 0 ? remaining[em.index! - 1] : prevChar;
-				const after: string | undefined = remaining[em.index! + em[0].length];
-				if ((em.index === 0 || WHITESPACE_OR_COLON_RE.test(before)) && (after === undefined || WHITESPACE_OR_COLON_RE.test(after))) {
-					emojiIdx = em.index!;
-					emojiMatch = em;
-					break;
-				}
-			}
-
-			let unicodeIdx: number = Infinity;
-			let unicodeMatch: RegExpMatchArray | null = null;
-			const um: RegExpMatchArray | null = remaining.match(UNICODE_EMOJI_RE);
-			if (um?.index !== undefined) {
-				unicodeIdx = um.index;
-				unicodeMatch = um;
-			}
-
-			let emoticonIdx: number = Infinity;
-			let emoticonKey: string = '';
-			if (this.options.emoticons) {
-				for (let i = 0; i < _emoticonCount; i++) {
-					const key: string = EMOTICON_LIST[i];
-					const idx: number = remaining.indexOf(key);
-					if (idx === -1 || idx >= emoticonIdx) continue;
-					const before: string = idx > 0 ? remaining[idx - 1] : prevChar;
-					const after: string | undefined = remaining[idx + key.length];
-					const validBefore: boolean = idx === 0 ? prevChar === '' || WHITESPACE_RE.test(prevChar) : WHITESPACE_RE.test(before);
-					const validAfter: boolean =
-						after === undefined || WHITESPACE_RE.test(after) || this.startsEmoticon(after + remaining.slice(idx + key.length + 1));
-					if (validBefore && validAfter) {
-						emoticonIdx = idx;
-						emoticonKey = key;
-					}
-				}
-			}
-
-			if (mentionIdx === Infinity && emojiIdx === Infinity && unicodeIdx === Infinity && emoticonIdx === Infinity) {
+			if (!hit) {
 				results.push(plain(remaining));
 				break;
 			}
 
-			const minIdx: number = Math.min(mentionIdx, emojiIdx, unicodeIdx, emoticonIdx);
-			if (minIdx > 0) results.push(plain(remaining.slice(0, minIdx)));
+			// Emit plain text before the hit
+			if (hit.idx > 0) results.push(plain(remaining.slice(0, hit.idx)));
 
-			if (minIdx === mentionIdx) {
-				let mentionText: string = mentionMatch![0];
-				let afterMention: string = remaining.slice(mentionIdx + mentionText.length);
-
-				const domainMatch: RegExpMatchArray | null = afterMention.match(AT_DOMAIN_RE);
-				if (domainMatch) {
-					mentionText += domainMatch[0];
-					afterMention = afterMention.slice(domainMatch[0].length);
+			switch (hit.type) {
+				case 'timestamp': {
+					const tsNode = this.parseTimestampTag(hit.text);
+					results.push(tsNode ?? plain(hit.text));
+					prevChar = '>';
+					remaining = remaining.slice(hit.idx + hit.text.length);
+					break;
 				}
-
-				const stripped: string = mentionText.replace(MENTION_TRAILING_UNDERSCORE_RE, '');
-				const leftover: string = mentionText.slice(stripped.length);
-				results.push(mentionUser(stripped.slice(1)));
-				prevChar = stripped.slice(-1);
-				remaining = leftover + afterMention;
-			} else if (minIdx === emojiIdx) {
-				results.push(emoji(emojiMatch![0].slice(1, -1)));
-				prevChar = ':';
-				remaining = remaining.slice(emojiIdx + emojiMatch![0].length);
-			} else if (minIdx === unicodeIdx) {
-				results.push(emojiUnicode(unicodeMatch![0]));
-				prevChar = unicodeMatch![0].slice(-1);
-				remaining = remaining.slice(unicodeIdx + unicodeMatch![0].length);
-			} else {
-				results.push(emoticonNode(emoticonKey, EMOTICONS[emoticonKey]));
-				prevChar = emoticonKey.slice(-1);
-				remaining = remaining.slice(emoticonIdx + emoticonKey.length);
+				case 'mention': {
+					let mentionText = hit.text;
+					let afterMention = remaining.slice(hit.idx + mentionText.length);
+					const domainMatch = matchAtDomain(afterMention);
+					if (domainMatch) {
+						mentionText += domainMatch;
+						afterMention = afterMention.slice(domainMatch.length);
+					}
+					const [stripped, leftover] = stripTrailingUnderscores(mentionText);
+					results.push(mentionUser(stripped.slice(1)));
+					prevChar = stripped.slice(-1);
+					remaining = leftover + afterMention;
+					break;
+				}
+				case 'emoji': {
+					results.push(emoji(hit.text.slice(1, -1)));
+					prevChar = ':';
+					remaining = remaining.slice(hit.idx + hit.text.length);
+					break;
+				}
+				case 'unicode': {
+					results.push(emojiUnicode(hit.text));
+					prevChar = hit.text.slice(-1);
+					remaining = remaining.slice(hit.idx + hit.text.length);
+					break;
+				}
+				case 'emoticon': {
+					results.push(emoticonNode(hit.key, EMOTICONS[hit.key]));
+					prevChar = hit.key.slice(-1);
+					remaining = remaining.slice(hit.idx + hit.key.length);
+					break;
+				}
 			}
 		}
 
 		return results;
-	}
-
-	private startsEmoticon(s: string): boolean {
-		return EMOTICON_LIST.some((k: string) => s.startsWith(k));
 	}
 
 	// ===========================================================================
@@ -1450,7 +1223,6 @@ class Parser {
 	private parseEscape(): Plain {
 		return plain(this.stream.consume().image[1]);
 	}
-
 	private parseFallback(): Plain {
 		return plain(this.stream.consume().image);
 	}
@@ -1460,14 +1232,12 @@ class Parser {
 	// ===========================================================================
 
 	private tryParseInlineCode(): InlineCode | null {
-		const savedPos: number = this.stream.getPos();
+		const savedPos = this.stream.getPos();
 		this.stream.consume();
-
 		const parts: string[] = [];
 
 		while (!this.stream.isAtEnd()) {
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-
 			if (this.stream.checkImage(SpecialChar, '`')) {
 				this.stream.consume();
 				if (parts.length === 0) {
@@ -1476,27 +1246,11 @@ class Parser {
 				}
 				return inlineCode(plain(parts.join('')));
 			}
-
 			parts.push(this.stream.consume().image);
 		}
-
 		this.stream.setPos(savedPos);
 		return null;
 	}
-}
-
-// =============================================================================
-// TIMESTAMP PRE-LEXER
-// =============================================================================
-
-function encodeTimestampSentinels(input: string): { encoded: string; map: string[] } {
-	const map: string[] = [];
-	const encoded: string = input.replace(TIMESTAMP_TAG_RE, (match: string) => {
-		const idx: number = map.length;
-		map.push(match);
-		return `${TIMESTAMP_SENTINEL_PREFIX}${idx}${TIMESTAMP_SENTINEL_PREFIX}`;
-	});
-	return { encoded, map };
 }
 
 // =============================================================================
@@ -1504,7 +1258,7 @@ function encodeTimestampSentinels(input: string): { encoded: string; map: string
 // =============================================================================
 
 export const parse = (input: string, options?: Options): Root => {
-	const { encoded, map }: { encoded: string; map: string[] } = encodeTimestampSentinels(input);
+	const { encoded, map } = encodeTimestamps(input);
 
 	if (map.length === 0) {
 		const { tokens, errors } = MessageLexer.tokenize(input);
@@ -1515,10 +1269,9 @@ export const parse = (input: string, options?: Options): Root => {
 	const { tokens, errors } = MessageLexer.tokenize(encoded);
 	if (errors.length > 0) throw new Error(`Lexer error: ${errors[0].message}`);
 
-	_sentinelRe.lastIndex = 0;
 	for (const tok of tokens) {
 		if (tok.tokenType.name === 'Plain') {
-			tok.image = tok.image.replace(_sentinelRe, (_: string, idx: string) => map[Number(idx)]);
+			tok.image = decodeSentinels(tok.image, map);
 		}
 	}
 
