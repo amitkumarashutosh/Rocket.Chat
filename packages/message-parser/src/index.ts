@@ -530,7 +530,7 @@ const parseBoldMarkup = (text: string, i: number, options?: Options): { tokens: 
 				result.push(ast.plain('*'));
 
 				// Add the bold content (double asterisk style)
-				const nestedContent = parseInlineContent(content, options);
+				const nestedContent = parseInlineContent(content, options, true);
 				const validContent = filterBoldContent(nestedContent);
 				result.push(ast.bold(validContent));
 
@@ -605,7 +605,7 @@ const parseBoldMarkup = (text: string, i: number, options?: Options): { tokens: 
 			return null;
 		}
 
-		const nestedContent = parseInlineContent(content, options);
+		const nestedContent = parseInlineContent(content, options, true);
 		const validContent = filterBoldContent(nestedContent);
 		return {
 			tokens: [ast.bold(validContent)],
@@ -652,8 +652,8 @@ const parseItalicMarkup = (text: string, i: number, options?: Options): { tokens
 						const afterSecond = nextSingleEnd + 1 < text.length ? text[nextSingleEnd + 1] : '';
 						const atSecondEndBoundary = nextSingleEnd + 1 >= text.length || /[\s\n\r\t\(\)\[\]{}.,;:!?*~`-]/.test(afterSecond);
 						if (atSecondEndBoundary) {
-							const firstInlineContent = parseInlineContent(contentBeforeDouble, options);
-							const secondInlineContent = parseInlineContent(secondContent, options);
+							const firstInlineContent = parseInlineContent(contentBeforeDouble, options, true);
+							const secondInlineContent = parseInlineContent(secondContent, options, true);
 							return {
 								tokens: [ast.italic(filterItalicContent(firstInlineContent)), ast.italic(filterItalicContent(secondInlineContent))],
 								// We consumed: _contentBeforeDouble __ secondContent _
@@ -705,7 +705,7 @@ const parseItalicMarkup = (text: string, i: number, options?: Options): { tokens
 					result.push(ast.plain('_'));
 
 					// Add the italic content (double underscore style)
-					const nestedContent = parseInlineContent(content, options);
+					const nestedContent = parseInlineContent(content, options, true);
 					const validContent = nestedContent.filter(
 						(token) =>
 							token.type !== 'ITALIC' &&
@@ -1030,7 +1030,7 @@ const parseItalicMarkup = (text: string, i: number, options?: Options): { tokens
 		}
 
 		// Add the italic content
-		const nestedContent = parseInlineContent(bestMatch.content, options);
+		const nestedContent = parseInlineContent(bestMatch.content, options, true);
 		const validContent = nestedContent.filter(
 			(token) =>
 				token.type !== 'ITALIC' &&
@@ -1104,7 +1104,7 @@ const parseStrikeMarkup = (text: string, i: number, options?: Options): { tokens
 					result.push(ast.plain('~'));
 
 					// Add the strike content (double tilde style)
-					const nestedContent = parseInlineContent(content, options);
+					const nestedContent = parseInlineContent(content, options, true);
 					const validContent = filterStrikeContent(nestedContent);
 					result.push(ast.strike(validContent));
 
@@ -1131,7 +1131,7 @@ const parseStrikeMarkup = (text: string, i: number, options?: Options): { tokens
 			return null;
 		}
 
-		const nestedContent = parseInlineContent(content, options);
+		const nestedContent = parseInlineContent(content, options, true);
 		// Filter to only valid strike content types
 		const validContent = filterStrikeContent(nestedContent);
 		return {
@@ -1159,7 +1159,7 @@ const parseStrikeMarkup = (text: string, i: number, options?: Options): { tokens
 					result.push(ast.plain('~'));
 
 					// Add the strike content
-					const nestedContent = parseInlineContent(content, options);
+					const nestedContent = parseInlineContent(content, options, true);
 					const validContent = filterStrikeContent(nestedContent);
 					result.push(ast.strike(validContent));
 
@@ -1179,7 +1179,7 @@ const parseStrikeMarkup = (text: string, i: number, options?: Options): { tokens
 				const result = [];
 
 				// Add the strike content
-				const nestedContent = parseInlineContent(content, options);
+				const nestedContent = parseInlineContent(content, options, true);
 				const validContent = filterStrikeContent(nestedContent);
 				result.push(ast.strike(validContent));
 
