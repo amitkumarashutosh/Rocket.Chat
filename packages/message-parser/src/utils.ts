@@ -6,10 +6,8 @@ import type {
 	Color,
 	Heading,
 	Markup,
-	Paragraph,
 	Types,
 	Task,
-	ListItem,
 	Inlines,
 	LineBreak,
 	Emoji,
@@ -17,6 +15,8 @@ import type {
 	InlineKaTeX,
 	Link,
 	Timestamp,
+	ListItem,
+	Plain,
 } from './definitions';
 
 const generate =
@@ -60,7 +60,6 @@ export const inlineCode = generate('INLINE_CODE');
 export const tasks = generate('TASKS');
 
 export const italic = generate('ITALIC');
-export const spoiler = generate('SPOILER');
 
 export const plain = generate('PLAIN_TEXT');
 export const strike = generate('STRIKE');
@@ -80,10 +79,10 @@ export const link = (src: string, label?: Markup[]): Link => ({
 	value: { src: plain(src), label: label ?? [plain(src)] },
 });
 
-export const autoLink = (src: string, customDomains?: string[]) => {
+export const autoLink = (src: string, customDomains?: string[]): Plain | Link => {
 	const validHosts = ['localhost', ...(customDomains ?? [])];
 	const { isIcann, isIp, isPrivate, domain } = tldParse(src, {
-		detectIp: true,
+		detectIp: false,
 		allowPrivateDomains: true,
 		validHosts,
 	});
@@ -97,7 +96,7 @@ export const autoLink = (src: string, customDomains?: string[]) => {
 	return link(href, [plain(src)]);
 };
 
-export const autoEmail = (src: string) => {
+export const autoEmail = (src: string): Plain | Link => {
 	const href = `mailto:${src}`;
 
 	const { isIcann, isIp, isPrivate } = tldParse(href, {
@@ -118,7 +117,6 @@ export const image = (() => {
 })();
 
 export const quote = generate('QUOTE');
-export const spoilerBlock = generate('SPOILER_BLOCK');
 
 export const mentionChannel = (() => {
 	const fn = generate('MENTION_CHANNEL');
@@ -129,10 +127,15 @@ export const orderedList = generate('ORDERED_LIST');
 
 export const unorderedList = generate('UNORDERED_LIST');
 
-export const listItem = (text: Inlines[], number?: number): ListItem => ({
+export const listItem = (text: Inlines[]): ListItem => ({
 	type: 'LIST_ITEM',
 	value: text,
-	...(number !== undefined && { number }),
+});
+
+export const orderedListItem = (text: Inlines[], number: number): ListItem => ({
+	type: 'LIST_ITEM',
+	value: text,
+	number,
 });
 
 export const mentionUser = (() => {
@@ -158,88 +161,9 @@ export const emoticon = (emoticon: string, shortCode: string): Emoji => ({
 	shortCode,
 });
 
-const joinEmoji = (current: Inlines, previous: Inlines | undefined, next: Inlines | undefined): Inlines => {
-	if (current.type !== 'EMOJI' || !current.value || (!previous && !next)) {
-		return current;
-	}
-
-	const hasEmojiAsNeighbor = previous?.type === current.type || current.type === next?.type;
-	const hasPlainAsNeighbor =
-		(previous?.type === 'PLAIN_TEXT' && previous.value.trim() !== '') || (next?.type === 'PLAIN_TEXT' && next.value.trim() !== '');
-	const isEmoticon = current.shortCode !== current.value.value;
-
-	if (current.value && (hasEmojiAsNeighbor || hasPlainAsNeighbor)) {
-		if (isEmoticon) {
-			return current.value;
-		}
-
-		return {
-			type: 'PLAIN_TEXT',
-			value: `:${current.value.value}:`,
-		};
-	}
-
-	return current;
-};
-
-export const reducePlainTexts = (values: Paragraph['value']): Paragraph['value'] => {
-	const result: Paragraph['value'] = [];
-	const flattenableValues = values as Array<Inlines | Inlines[]>;
-
-	let previousInline = undefined as Inlines | undefined;
-	let pendingInline = undefined as Inlines | undefined;
-
-	const appendJoinedInline = (inline: Inlines, nextInline: Inlines | undefined): void => {
-		const current = joinEmoji(inline, previousInline, nextInline);
-		const previous = result[result.length - 1];
-
-		if (previous && current.type === 'PLAIN_TEXT' && previous.type === 'PLAIN_TEXT') {
-			previous.value += current.value;
-		} else {
-			result.push(current);
-		}
-
-		previousInline = inline;
-	};
-
-	for (let index = 0; index < flattenableValues.length; index++) {
-		const entry = flattenableValues[index];
-
-		if (Array.isArray(entry)) {
-			for (let nestedIndex = 0; nestedIndex < entry.length; nestedIndex++) {
-				const currentInline = entry[nestedIndex];
-
-				if (pendingInline === undefined) {
-					pendingInline = currentInline;
-					continue;
-				}
-
-				appendJoinedInline(pendingInline, currentInline);
-				pendingInline = currentInline;
-			}
-
-			continue;
-		}
-
-		if (pendingInline === undefined) {
-			pendingInline = entry;
-			continue;
-		}
-
-		appendJoinedInline(pendingInline, entry);
-		pendingInline = entry;
-	}
-
-	if (pendingInline !== undefined) {
-		appendJoinedInline(pendingInline, undefined);
-	}
-
-	return result;
-};
-export const lineBreak = (): LineBreak => ({
+export const lineBreak: LineBreak = {
 	type: 'LINE_BREAK',
-	value: undefined,
-});
+};
 
 export const katex = (content: string): KaTeX => ({
 	type: 'KATEX',
@@ -311,5 +235,5 @@ export const extractFirstResult = (value: Types[keyof Types]['value']): Types[ke
 		return value;
 	}
 
-	return value.find(Boolean) as Types[keyof Types]['value'];
+	return value.filter((item) => item).shift() as Types[keyof Types]['value'];
 };
