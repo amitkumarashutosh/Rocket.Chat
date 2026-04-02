@@ -161,9 +161,10 @@ export const emoticon = (emoticon: string, shortCode: string): Emoji => ({
 	shortCode,
 });
 
-export const lineBreak: LineBreak = {
+export const lineBreak = (): LineBreak => ({
 	type: 'LINE_BREAK',
-};
+	value: undefined,
+});
 
 export const katex = (content: string): KaTeX => ({
 	type: 'KATEX',

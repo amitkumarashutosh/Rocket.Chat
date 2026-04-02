@@ -2499,7 +2499,7 @@ export const parse = (input: string, options?: Options): AST.Root => {
 				}
 			}
 			if (hasContentBefore) {
-				result.push(ast.lineBreak);
+				result.push(ast.lineBreak());
 			}
 		} else {
 			// Non-empty line creates a paragraph
