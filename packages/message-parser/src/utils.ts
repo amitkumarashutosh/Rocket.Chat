@@ -17,6 +17,9 @@ import type {
 	Timestamp,
 	ListItem,
 	Plain,
+	Spoiler,
+	Paragraph,
+	SpoilerBlock,
 } from './definitions';
 
 const generate =
@@ -77,6 +80,16 @@ const isValidLink = (link: string) => {
 export const link = (src: string, label?: Markup[]): Link => ({
 	type: 'LINK',
 	value: { src: plain(src), label: label ?? [plain(src)] },
+});
+
+export const spoiler = (value: Inlines[]): Spoiler => ({
+	type: 'SPOILER',
+	value,
+});
+
+export const spoilerBlock = (value: Paragraph[]): SpoilerBlock => ({
+	type: 'SPOILER_BLOCK',
+	value,
 });
 
 export const autoLink = (src: string, customDomains?: string[]): Plain | Link => {

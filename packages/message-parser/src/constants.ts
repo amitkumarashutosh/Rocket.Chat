@@ -116,7 +116,7 @@ export const RE_TIMESTAMP_TIME_CAPTURE = /^(\d{1,2}):(\d{2})(?::(\d{2}))?([+-]\d
  */
 export const TRIGGER_ASCII = (() => {
 	const arr = new Uint8Array(128);
-	const triggers = ['*', '_', '~', '`', '(', ')', '<', '!', '[', ']', ':', '@', '#'];
+	const triggers = ['*', '_', '~', '`', '(', ')', '<', '!', '[', ']', ':', '@', '#', '|'];
 	for (let i = 0; i < triggers.length; i++) {
 		const code = triggers[i].charCodeAt(0);
 		if (code < 128) arr[code] = 1;

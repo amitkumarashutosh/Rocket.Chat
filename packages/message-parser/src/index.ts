@@ -1719,6 +1719,18 @@ const parseInlineContent = (text: string, options?: Options, skipUrlDetection = 
 			}
 		}
 
+		// Spoiler parsing: ||content||
+		if (char === '|' && text[i + 1] === '|') {
+			const endIndex = text.indexOf('||', i + 2);
+			if (endIndex !== -1 && endIndex > i + 2) {
+				const content = text.slice(i + 2, endIndex);
+				const nestedContent = parseInlineContent(content, options, true);
+				tokens.push(ast.spoiler(nestedContent));
+				i = endIndex + 2;
+				continue;
+			}
+		}
+
 		// Emoticon parsing (text-based emoticons like :), D:, etc.)
 		let found = false;
 		if (options?.emoticons) {
@@ -1801,7 +1813,7 @@ const parseInlineContent = (text: string, options?: Options, skipUrlDetection = 
 			}
 
 			// Stop if we hit markup characters, but be careful with @ for emails
-			if (['*', '_', '~', '#', '`', '[', '<'].includes(currentChar)) {
+			if (['*', '_', '~', '#', '`', '[', '<', '|'].includes(currentChar)) {
 				break;
 			}
 
@@ -2274,6 +2286,36 @@ export const parse = (input: string, options?: Options): AST.Root => {
 	let i = 0;
 	while (i < lines.length) {
 		const line = lines[i];
+
+		// Check for block spoiler: line is exactly "||" opening, collect lines until closing "||"
+		if (line.trim() === '||') {
+			let closingIndex = -1;
+			for (let j = i + 1; j < lines.length; j++) {
+				if (lines[j].trim() === '||') {
+					closingIndex = j;
+					break;
+				}
+			}
+
+			if (closingIndex !== -1) {
+				const spoilerParagraphs: AST.Paragraph[] = [];
+				for (let j = i + 1; j < closingIndex; j++) {
+					const lineContent = lines[j];
+					if (lineContent.trim() === '') {
+						spoilerParagraphs.push(ast.paragraph([]));
+					} else {
+						const inlineContent = parseInlineContent(lineContent, options);
+						spoilerParagraphs.push(ast.paragraph(inlineContent));
+					}
+				}
+				result.push(ast.spoilerBlock(spoilerParagraphs));
+				i = closingIndex + 1;
+				if (i < lines.length && lines[i].trim() !== '') {
+					result.push(ast.lineBreak());
+				}
+				continue;
+			}
+		}
 
 		// Check for code fence start (must be at beginning of line and have matching closing)
 		if (line.startsWith('```')) {

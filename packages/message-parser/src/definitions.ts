@@ -86,19 +86,29 @@ export type Quote = {
 export type Markup = Italic | Strike | Bold | Plain | ChannelMention;
 export type MarkupExcluding<T extends Markup> = Exclude<Markup, T>;
 
+export type Spoiler = {
+	type: 'SPOILER';
+	value: Inlines[];
+};
+
+export type SpoilerBlock = {
+	type: 'SPOILER_BLOCK';
+	value: Paragraph[];
+};
+
 export type Bold = {
 	type: 'BOLD';
-	value: Array<MarkupExcluding<Bold> | Link | Emoji | UserMention | ChannelMention | InlineCode>;
+	value: Array<MarkupExcluding<Bold> | Link | Emoji | UserMention | ChannelMention | InlineCode | Spoiler>;
 };
 
 export type Italic = {
 	type: 'ITALIC';
-	value: Array<MarkupExcluding<Italic> | Link | Emoji | UserMention | ChannelMention | InlineCode>;
+	value: Array<MarkupExcluding<Italic> | Link | Emoji | UserMention | ChannelMention | InlineCode | Spoiler>;
 };
 
 export type Strike = {
 	type: 'STRIKE';
-	value: Array<MarkupExcluding<Strike> | Link | Emoji | UserMention | ChannelMention | InlineCode | Italic | Timestamp>;
+	value: Array<MarkupExcluding<Strike> | Link | Emoji | UserMention | ChannelMention | InlineCode | Italic | Timestamp | Spoiler>;
 };
 
 export type Plain = {
@@ -185,9 +195,12 @@ export type Types = {
 	LIST_ITEM: ListItem;
 	IMAGE: Image;
 	LINE_BREAK: LineBreak;
+	SPOILER: Spoiler;
+	SPOILER_BLOCK: SpoilerBlock;
 };
 
 export type ASTNode =
+	| Spoiler
 	| BigEmoji
 	| Bold
 	| Paragraph
@@ -209,6 +222,7 @@ export type ASTNode =
 export type TypesKeys = keyof Types;
 
 export type Inlines =
+	| Spoiler
 	| Timestamp
 	| Bold
 	| Plain
@@ -223,6 +237,6 @@ export type Inlines =
 	| Color
 	| InlineKaTeX;
 
-export type Blocks = Code | Heading | Quote | ListItem | Tasks | OrderedList | UnorderedList | LineBreak | KaTeX;
+export type Blocks = Code | Heading | Quote | ListItem | Tasks | OrderedList | UnorderedList | LineBreak | KaTeX | SpoilerBlock;
 
 export type Root = Array<Paragraph | Blocks> | [BigEmoji];
