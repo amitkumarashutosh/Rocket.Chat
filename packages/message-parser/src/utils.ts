@@ -82,7 +82,7 @@ export const link = (src: string, label?: Markup[]): Link => ({
 export const autoLink = (src: string, customDomains?: string[]): Plain | Link => {
 	const validHosts = ['localhost', ...(customDomains ?? [])];
 	const { isIcann, isIp, isPrivate, domain } = tldParse(src, {
-		detectIp: false,
+		detectIp: true,
 		allowPrivateDomains: true,
 		validHosts,
 	});
