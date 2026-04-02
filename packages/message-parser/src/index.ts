@@ -2378,7 +2378,7 @@ export const parse = (input: string, options?: Options): AST.Root => {
 				for (const quoteLine of quoteLines) {
 					if (quoteLine.trim() === '') {
 						// Empty quote line - still create a paragraph with empty content
-						quoteParagraphs.push(ast.paragraph([]));
+						quoteParagraphs.push(ast.paragraph([ast.plain('')]));
 					} else {
 						const inlineContent = parseInlineContent(quoteLine, options);
 						quoteParagraphs.push(ast.paragraph(inlineContent));
