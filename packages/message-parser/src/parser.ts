@@ -1159,15 +1159,36 @@ class Parser {
 		let prevChar = '';
 
 		while (remaining.length > 0) {
-			// Single call finds the earliest of all pattern types in one pass
+			const spoilerIdx = remaining.indexOf('||');
 			const hit: ScanHit | null = scanPlainText(remaining, prevChar, noTimestamp, !!this.options.emoticons, EMOTICON_LIST);
+
+			// if || comes before any other hit, handle it first
+			if (spoilerIdx !== -1 && (hit === null || spoilerIdx < hit.idx)) {
+				if (spoilerIdx > 0) results.push(plain(remaining.slice(0, spoilerIdx)));
+				// find closing ||
+				const closeIdx = remaining.indexOf('||', spoilerIdx + 2);
+				if (closeIdx !== -1) {
+					const innerText = remaining.slice(spoilerIdx + 2, closeIdx);
+					if (innerText.length > 0) {
+						const inner = this.parseQuoteLine(innerText);
+						results.push(spoiler(inner as Spoiler['value']));
+						prevChar = '|';
+						remaining = remaining.slice(closeIdx + 2);
+						continue;
+					}
+				}
+				// no valid closing || found, treat as plain
+				results.push(plain('||'));
+				prevChar = '|';
+				remaining = remaining.slice(spoilerIdx + 2);
+				continue;
+			}
 
 			if (!hit) {
 				results.push(plain(remaining));
 				break;
 			}
 
-			// Emit plain text before the hit
 			if (hit.idx > 0) results.push(plain(remaining.slice(0, hit.idx)));
 
 			switch (hit.type) {
