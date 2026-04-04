@@ -480,7 +480,8 @@ export function findUnicodeEmoji(s: string, startIndex: number = 0): [number, st
 // =============================================================================
 
 function isEmailLocalCharCode(c: number): boolean {
-	return c < 128 && (_ASCII[c] & F_EMAIL_LOCAL) !== 0;
+	if (c < 128) return (_ASCII[c] & F_EMAIL_LOCAL) !== 0;
+	return inFlatRanges(c, UW_FLAT);
 }
 
 function isEmailDomainCharCode(c: number): boolean {
@@ -503,8 +504,12 @@ export function tryMatchEmailAt(s: string, pos: number): string | null {
 	while (i < s.length && s.charCodeAt(i) === 0x2e) {
 		i++;
 		const labelStart = i;
-		while (i < s.length && (isEmailDomainCharCode(s.charCodeAt(i)) || s.charCodeAt(i) === 0x2e)) i++;
+		while (i < s.length && isEmailDomainCharCode(s.charCodeAt(i))) i++;
 		if (i > labelStart) lastWasLabel = true;
+		else {
+			i--;
+			break;
+		} // trailing dot — back up and stop
 	}
 	if (!lastWasLabel && i <= domainStart + 1) return null;
 	if (!isUnicodeWord(s[i - 1])) return null;
@@ -513,12 +518,15 @@ export function tryMatchEmailAt(s: string, pos: number): string | null {
 }
 
 export function findEmailInText(s: string, startIndex: number = 0): [number, string] | null {
-	// Fast pre-check: no '@' = no email
 	if (!s.includes('@')) return null;
 	let i = s.indexOf('@', startIndex + 1);
 	while (i !== -1) {
 		let localStart = i - 1;
-		while (localStart > startIndex && isEmailLocalCharCode(s.charCodeAt(localStart - 1))) localStart--;
+		while (localStart > startIndex) {
+			const c = s.charCodeAt(localStart - 1);
+			if (isEmailLocalCharCode(c) || (c >= 0x80 && inFlatRanges(c, UW_FLAT))) localStart--;
+			else break;
+		}
 		if (localStart >= 7 && s.slice(localStart - 7, localStart) === 'mailto:') localStart -= 7;
 		const match = tryMatchEmailAt(s, localStart);
 		if (match && localStart + match.indexOf('@') === i) return [localStart, match];

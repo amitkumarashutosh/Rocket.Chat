@@ -17,6 +17,7 @@ import type {
 	InlineKaTeX,
 	Link,
 	Timestamp,
+	Plain,
 } from './definitions';
 
 const generate =
@@ -97,8 +98,9 @@ export const autoLink = (src: string, customDomains?: string[]) => {
 	return link(href, [plain(src)]);
 };
 
-export const autoEmail = (src: string) => {
-	const href = `mailto:${src}`;
+export const autoEmail = (src: string): Link | Plain => {
+	const cleanSrc = src.endsWith('.') ? src.slice(0, -1) : src;
+	const href = `mailto:${cleanSrc}`;
 
 	const { isIcann, isIp, isPrivate } = tldParse(href, {
 		detectIp: false,
@@ -109,7 +111,7 @@ export const autoEmail = (src: string) => {
 		return plain(src);
 	}
 
-	return link(href, [plain(src)]);
+	return link(href, [plain(cleanSrc)]);
 };
 
 export const image = (() => {
