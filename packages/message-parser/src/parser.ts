@@ -1230,37 +1230,71 @@ class Parser {
 		}
 
 		// Bare domain autolink — only when not inside a link label
+		// Bare domain/URL autolink — scan through full text for embedded URLs and domains
 		if (!_ctx.inLinkLabel) {
-			const dmFull = /^([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-z]{2,})+(?::\d+)?)$/.exec(text.trim());
-			if (dmFull) {
-				const candidate = dmFull[1];
-				const node = autoLink(candidate, this.options.customDomains);
-				if (node.type !== 'PLAIN_TEXT') {
-					const before = text.slice(0, text.indexOf(candidate));
-					const leftover = text.slice(text.indexOf(candidate) + candidate.length);
-					if (leftover) this.pending.push(...this.splitPlainText(leftover, false));
-					if (before) {
-						this.pending.unshift(node);
-						return plain(before);
-					}
-					return node;
-				}
-			}
-			const dmAfterSpace = /(?<=\s)([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-z]{2,})+(?::\d+)?)$/.exec(text);
-			if (dmAfterSpace) {
-				const candidate = dmAfterSpace[1];
-				const node = autoLink(candidate, this.options.customDomains);
-				if (node.type !== 'PLAIN_TEXT') {
-					const before = text.slice(0, text.length - candidate.length);
-					this.pending.unshift(node);
-					return plain(before);
-				}
+			const urlAndDomainNodes = this.scanForUrlsAndDomains(text);
+			if (urlAndDomainNodes.length > 1 || (urlAndDomainNodes.length === 1 && urlAndDomainNodes[0].type !== 'PLAIN_TEXT')) {
+				if (urlAndDomainNodes.length > 1) this.pending.push(...urlAndDomainNodes.slice(1));
+				return urlAndDomainNodes[0];
 			}
 		}
 
 		const nodes = this.splitPlainText(text, false);
 		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
 		return nodes[0];
+	}
+
+	private scanForUrlsAndDomains(text: string): Inlines[] {
+		const results: Inlines[] = [];
+		let remaining = text;
+
+		while (remaining.length > 0) {
+			// match https?:// or www. URLs embedded in text
+			const urlMatch = /(?:^|(?<=\s))((?:https?:\/\/|www\.)[^\s]+)/.exec(remaining);
+			// match bare domains like google.com, test.1test.com
+			const domainMatch =
+				/(?:^|(?<=\s))([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-zA-Z0-9][a-zA-Z0-9\-]*)+(?::\d+)?(?:\/[^\s]*)?)(?=\s|$|[!,\.]\s|[!,\.]$)/.exec(
+					remaining,
+				);
+
+			let match: RegExpExecArray | null = null;
+			let matchStr = '';
+
+			if (urlMatch && domainMatch) {
+				match = urlMatch.index <= domainMatch.index ? urlMatch : domainMatch;
+			} else {
+				match = urlMatch ?? domainMatch;
+			}
+
+			if (!match) {
+				results.push(plain(remaining));
+				break;
+			}
+
+			matchStr = match[1];
+			const matchStart = match.index + (match[0].length - match[1].length);
+
+			if (matchStart > 0) results.push(plain(remaining.slice(0, matchStart)));
+
+			// strip trailing punctuation
+			let candidate = matchStr;
+			while (candidate.length > 0 && /[!,\.]$/.test(candidate)) {
+				candidate = candidate.slice(0, -1);
+			}
+			const leftoverPunct = matchStr.slice(candidate.length);
+
+			const node = autoLink(candidate, this.options.customDomains);
+			if (node.type !== 'PLAIN_TEXT') {
+				results.push(node);
+				if (leftoverPunct) results.push(plain(leftoverPunct));
+			} else {
+				results.push(plain(matchStr));
+			}
+
+			remaining = remaining.slice(matchStart + matchStr.length);
+		}
+
+		return results;
 	}
 
 	// ===========================================================================
