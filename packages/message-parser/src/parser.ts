@@ -166,6 +166,7 @@ type FormattingContext = {
 	inBold?: boolean;
 	inItalic?: boolean;
 	inStrike?: boolean;
+	inLinkLabel?: boolean;
 };
 
 class Parser {
@@ -446,7 +447,12 @@ class Parser {
 			while (!this.stream.isAtEnd() && !this.stream.check(NewLine) && !this.stream.check(DoubleNewLine)) {
 				lineParts.push(this.stream.consume().image);
 			}
-			paragraphs.push(paragraph(reducePlainTexts(this.parseQuoteLine(lineParts.join('')))));
+			const lineText = lineParts.join('');
+			if (paragraphs.length === 0 && lineText.trim() === '') {
+				this.stream.setPos(savedPos);
+				return null;
+			}
+			paragraphs.push(paragraph(reducePlainTexts(this.parseQuoteLine(lineText))));
 			if (this.stream.check(NewLine)) this.stream.consume();
 			else break;
 		}
@@ -595,6 +601,12 @@ class Parser {
 	}
 
 	private parseInline(ctx: FormattingContext): Inlines | null {
+		// Slack-style <url|label> — handle at token level to support URLs with # etc.
+		if (this.stream.check(PlainToken) && this.stream.peek()!.image.startsWith('<')) {
+			const node = this.tryParseAngleBracketLink();
+			if (node) return node;
+		}
+
 		if (this.stream.check(Escape)) return this.parseEscape();
 
 		if (this.stream.check(LiteralBackslash)) {
@@ -642,7 +654,7 @@ class Parser {
 			if (node) return node;
 		}
 		if (this.stream.checkImage(SpecialChar, '#')) {
-			const node = this.tryParseChannelMention();
+			const node = this.tryParseChannelMention(ctx);
 			if (node) return node;
 		}
 
@@ -665,6 +677,36 @@ class Parser {
 
 		if (this.stream.check(CodeFence)) return plain(this.stream.consume().image);
 		return this.parseFallback();
+	}
+
+	private tryParseAngleBracketLink(): Link | null {
+		const savedPos = this.stream.getPos();
+		const parts: string[] = [];
+
+		// consume tokens until we find one ending with '>' or hit newline/end
+		while (!this.stream.isAtEnd()) {
+			if (this.stream.check(NewLine) || this.stream.check(DoubleNewLine)) break;
+			const tok = this.stream.consume();
+			parts.push(tok.image);
+			const joined = parts.join('');
+			if (joined.endsWith('>')) {
+				const inner = joined.slice(1, -1); // strip < and >
+				const pipeIdx = inner.indexOf('|');
+				if (pipeIdx !== -1) {
+					const url = inner.slice(0, pipeIdx).trim();
+					const label = inner.slice(pipeIdx + 1).trim();
+					if (url.length > 0 && label.length > 0) {
+						return link(url, [plain(label)]);
+					}
+				}
+				// matched a > but no valid pipe — backtrack
+				this.stream.setPos(savedPos);
+				return null;
+			}
+		}
+
+		this.stream.setPos(savedPos);
+		return null;
 	}
 
 	// ===========================================================================
@@ -697,10 +739,11 @@ class Parser {
 	// CHANNEL MENTION
 	// ===========================================================================
 
-	private tryParseChannelMention(): ChannelMention | null {
+	private tryParseChannelMention(ctx: FormattingContext = {}): ChannelMention | null {
 		const savedPos = this.stream.getPos();
 		const prevChar = prevTokenLastChar(this.stream, savedPos);
 		if (isWordChar(prevChar) || prevChar === '#' || prevChar === ':' || prevChar === '@') return null;
+		if (ctx.inLinkLabel) return null;
 		const prevImg = savedPos > 0 ? this.stream.tokenAt(savedPos - 1)?.image : undefined;
 		if (prevImg === 'color:') return null;
 
@@ -913,10 +956,29 @@ class Parser {
 
 	private parseLinkLabel(ctx: FormattingContext): Inlines[] {
 		const nodes: Inlines[] = [];
+		const innerCtx = { ...ctx, inLinkLabel: true };
+		let depth = 0;
+		const MAX_DEPTH = 1;
 		while (!this.stream.isAtEnd()) {
-			if (this.stream.checkImage(SpecialChar, ']')) break;
 			if (this.stream.check(DoubleNewLine) || this.stream.check(NewLine)) break;
-			const node = this.parseInline(ctx);
+			if (this.stream.checkImage(SpecialChar, '[')) {
+				if (depth >= MAX_DEPTH) {
+					nodes.push(plain(this.stream.consume().image));
+					continue;
+				}
+				depth++;
+				nodes.push(plain(this.stream.consume().image));
+				continue;
+			}
+			if (this.stream.checkImage(SpecialChar, ']')) {
+				if (depth > 0) {
+					depth--;
+					nodes.push(plain(this.stream.consume().image));
+					continue;
+				}
+				break;
+			}
+			const node = this.parseInline(innerCtx);
 			if (node) nodes.push(node);
 		}
 		return nodes;
@@ -927,16 +989,32 @@ class Parser {
 		if (!tok?.image.startsWith('(')) return null;
 		this.stream.consume();
 		let raw = tok.image.slice(1);
-		if (raw.endsWith(')')) return raw.slice(0, -1);
-		while (!this.stream.isAtEnd()) {
-			const t = this.stream.consume();
-			if (t.image.endsWith(')')) {
-				raw += t.image.slice(0, -1);
-				return raw;
-			}
-			raw += t.image;
+
+		// collect all tokens until we find a closing paren
+		while (!raw.includes(')')) {
+			if (this.stream.isAtEnd()) return null;
+			raw += this.stream.consume().image;
 		}
-		return null;
+
+		// walk char-by-char tracking paren depth to find correct closing ')'
+		let depth = 0;
+		let end = -1;
+		for (let i = 0; i < raw.length; i++) {
+			if (raw[i] === '(') depth++;
+			else if (raw[i] === ')') {
+				if (depth === 0) {
+					end = i;
+					break;
+				}
+				depth--;
+			}
+		}
+		if (end === -1) return null;
+
+		const urlPart = raw.slice(0, end);
+		const leftover = raw.slice(end + 1);
+		if (leftover) this.pending.push(plain(leftover));
+		return urlPart;
 	}
 
 	private resolveLinkUrl(urlRaw: string, labelNodes: Inlines[]): Link {
@@ -1144,6 +1222,35 @@ class Parser {
 			}
 		}
 
+		// Bare domain autolink — only when not inside a link label
+		if (!_ctx.inLinkLabel) {
+			const dmFull = /^([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-z]{2,})+(?::\d+)?)$/.exec(text.trim());
+			if (dmFull) {
+				const candidate = dmFull[1];
+				const node = autoLink(candidate, this.options.customDomains);
+				if (node.type !== 'PLAIN_TEXT') {
+					const before = text.slice(0, text.indexOf(candidate));
+					const leftover = text.slice(text.indexOf(candidate) + candidate.length);
+					if (leftover) this.pending.push(...this.splitPlainText(leftover, _ctx.inBold));
+					if (before) {
+						this.pending.unshift(node);
+						return plain(before);
+					}
+					return node;
+				}
+			}
+			const dmAfterSpace = /(?<=\s)([a-zA-Z0-9][a-zA-Z0-9\-]*(?:\.[a-z]{2,})+(?::\d+)?)$/.exec(text);
+			if (dmAfterSpace) {
+				const candidate = dmAfterSpace[1];
+				const node = autoLink(candidate, this.options.customDomains);
+				if (node.type !== 'PLAIN_TEXT') {
+					const before = text.slice(0, text.length - candidate.length);
+					this.pending.unshift(node);
+					return plain(before);
+				}
+			}
+		}
+
 		const nodes = this.splitPlainText(text, _ctx.inBold);
 		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
 		return nodes[0];
@@ -1165,7 +1272,6 @@ class Parser {
 			// if || comes before any other hit, handle it first
 			if (spoilerIdx !== -1 && (hit === null || spoilerIdx < hit.idx)) {
 				if (spoilerIdx > 0) results.push(plain(remaining.slice(0, spoilerIdx)));
-				// find closing ||
 				const closeIdx = remaining.indexOf('||', spoilerIdx + 2);
 				if (closeIdx !== -1) {
 					const innerText = remaining.slice(spoilerIdx + 2, closeIdx);
@@ -1177,7 +1283,6 @@ class Parser {
 						continue;
 					}
 				}
-				// no valid closing || found, treat as plain
 				results.push(plain('||'));
 				prevChar = '|';
 				remaining = remaining.slice(spoilerIdx + 2);
