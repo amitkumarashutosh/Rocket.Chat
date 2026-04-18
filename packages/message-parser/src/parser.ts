@@ -264,7 +264,9 @@ class Parser {
 				const prevNL = pos === 0 || prev?.tokenType.name === NewLine.name || prev?.tokenType.name === DoubleNewLine.name;
 				const next = this.stream.peekAt(1);
 				const nextIsSpace = next?.tokenType.name === PlainToken.name && next.image.startsWith(' ');
-				if (prevNL && nextIsSpace) {
+				const afterNext = this.stream.peekAt(2);
+				const hasContent = afterNext !== undefined && !(afterNext.tokenType.name === SpecialChar.name && afterNext.image === '*');
+				if (prevNL && nextIsSpace && hasContent) {
 					const block = this.tryParseUnorderedList('*');
 					if (block) {
 						blocks.push(block);
@@ -783,6 +785,7 @@ class Parser {
 			...ctx,
 			inBold: delim === '*' ? true : ctx.inBold,
 			inStrike: delim === '~' ? true : ctx.inStrike,
+			inLinkLabel: ctx.inLinkLabel,
 		};
 		const inner: Inlines[] = [];
 		let closed = false;
@@ -796,6 +799,7 @@ class Parser {
 
 				if (isDouble && closingDouble) {
 					this.stream.consume();
+					while (this.pending.length > 0) inner.push(this.pending.shift()!);
 					closed = true;
 					break;
 				} else if (isDouble && !closingDouble) {
@@ -808,6 +812,7 @@ class Parser {
 					this.stream.setPos(savedPos);
 					return null;
 				} else {
+					while (this.pending.length > 0) inner.push(this.pending.shift()!);
 					closed = true;
 					break;
 				}
@@ -844,7 +849,7 @@ class Parser {
 		const isDouble = this.stream.checkImage(SpecialChar, '_');
 		if (isDouble) this.stream.consume();
 
-		const innerCtx: FormattingContext = { ...ctx, inItalic: true };
+		const innerCtx: FormattingContext = { ...ctx, inItalic: true, inLinkLabel: ctx.inLinkLabel };
 		const inner: Inlines[] = [];
 		let closed = false;
 
@@ -865,6 +870,7 @@ class Parser {
 						continue;
 					}
 					this.stream.consume();
+					while (this.pending.length > 0) inner.push(this.pending.shift()!);
 					closed = true;
 					break;
 				} else if (isDouble && !closingDouble) {
@@ -887,6 +893,7 @@ class Parser {
 						this.stream.setPos(savedPos);
 						return null;
 					}
+					while (this.pending.length > 0) inner.push(this.pending.shift()!);
 					closed = true;
 					break;
 				}
@@ -1211,7 +1218,7 @@ class Parser {
 				const emailNode = autoEmail(address);
 				if (emailNode.type !== 'PLAIN_TEXT') {
 					if (after.length > 0) {
-						const afterNodes = this.splitPlainText(after, _ctx.inBold);
+						const afterNodes = this.splitPlainText(after, false);
 						this.pending.unshift(emailNode, ...afterNodes);
 					} else {
 						this.pending.unshift(emailNode);
@@ -1231,7 +1238,7 @@ class Parser {
 				if (node.type !== 'PLAIN_TEXT') {
 					const before = text.slice(0, text.indexOf(candidate));
 					const leftover = text.slice(text.indexOf(candidate) + candidate.length);
-					if (leftover) this.pending.push(...this.splitPlainText(leftover, _ctx.inBold));
+					if (leftover) this.pending.push(...this.splitPlainText(leftover, false));
 					if (before) {
 						this.pending.unshift(node);
 						return plain(before);
@@ -1251,7 +1258,7 @@ class Parser {
 			}
 		}
 
-		const nodes = this.splitPlainText(text, _ctx.inBold);
+		const nodes = this.splitPlainText(text, false);
 		if (nodes.length > 1) this.pending.push(...nodes.slice(1));
 		return nodes[0];
 	}
