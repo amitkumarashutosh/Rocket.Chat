@@ -3,6 +3,9 @@ import { Inlines, LineBreak, Options, Root } from './index';
 import { Scanner } from './scanner';
 import { lineBreak, paragraph, plain, reducePlainTexts } from './utils';
 
+// ----- Constants ------------------------------------------------------------
+const ESCAPABLE = new Set(['*', '_', '~', '#', '.', '`']);
+
 // ----- Helpers --------------------------------------------------------------
 function consumeEndOfLine(s: Scanner): void {
 	if (s.isEnd()) return;
@@ -36,6 +39,19 @@ function parseInline(scanner: Scanner, options: Options) {
 	const nodes: Inlines[] = [];
 	while (!scanner.isEnd() && !isNewline(scanner.char())) {
 		const ch = scanner.char();
+
+		if (ch === '\\') {
+			const next = scanner.charAt(1);
+			if (next !== '' && ESCAPABLE.has(next)) {
+				nodes.push(plain(next));
+				scanner.consume(2);
+				continue;
+			}
+
+			nodes.push(plain(ch));
+			scanner.consume();
+			continue;
+		}
 
 		if (isPlainChar(ch)) {
 			const start = scanner.position();
