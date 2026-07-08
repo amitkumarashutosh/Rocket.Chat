@@ -1,7 +1,7 @@
-import { isNewline, isPlainChar } from './chars';
-import { Inlines, LineBreak, Options, Root } from './index';
+import { isAlphaNum, isNewline, isPlainChar, isSpace } from './chars';
+import { Heading, Inlines, LineBreak, Options, Root } from './index';
 import { Scanner } from './scanner';
-import { inlineCode, lineBreak, paragraph, plain, reducePlainTexts } from './utils';
+import { heading, inlineCode, lineBreak, mentionChannel, paragraph, plain, reducePlainTexts } from './utils';
 
 // ----- Constants ------------------------------------------------------------
 const ESCAPABLE = new Set(['*', '_', '~', '#', '.', '`']);
@@ -24,6 +24,13 @@ export function parse(input: string, options: Options = {}) {
 			root.push(lineBreakNode);
 			continue;
 		}
+
+		const headingNode: Heading | null = tryHeading(scanner, options);
+		if (headingNode !== null) {
+			root.push(headingNode);
+			continue;
+		}
+
 		const inlines = parseInline(scanner, options);
 		if (inlines.length > 0) {
 			root.push(paragraph(inlines));
@@ -114,4 +121,42 @@ function tryInlineCode(scanner: Scanner): Inlines | null {
 
 	scanner.consume();
 	return inlineCode(plain(content));
+}
+
+// ------ Block methods ----------------------------------------------------
+
+function tryHeading(scanner: Scanner, options: Options): Heading | null {
+	const start = scanner.position();
+
+	let level = 0; // Count # characters (max 4)
+
+	while (level < 4 && scanner.char() === '#') {
+		scanner.consume();
+		level++;
+	}
+
+	if (level === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Must be followed by at least one space or tab
+	if (!isSpace(scanner.char())) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Skip all leading spaces/tabs
+	while (isSpace(scanner.char())) {
+		scanner.consume();
+	}
+
+	if (scanner.isEnd() || isNewline(scanner.char())) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	const inlines = parseInline(scanner, options);
+	consumeEndOfLine(scanner);
+	return heading(inlines, level as 1 | 2 | 3 | 4);
 }
