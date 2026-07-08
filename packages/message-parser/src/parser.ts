@@ -44,6 +44,7 @@ export function parse(input: string, options: Options = {}) {
 
 function parseInline(scanner: Scanner, options: Options) {
 	const nodes: Inlines[] = [];
+	let prev = '';
 
 	while (!scanner.isEnd() && !isNewline(scanner.char())) {
 		const ch = scanner.char();
@@ -54,11 +55,13 @@ function parseInline(scanner: Scanner, options: Options) {
 			if (next !== '' && ESCAPABLE.has(next)) {
 				nodes.push(plain(next));
 				scanner.consume(2);
+				prev = next;
 				continue;
 			}
 
 			nodes.push(plain(ch));
 			scanner.consume();
+			prev = ch;
 			continue;
 		}
 
@@ -67,6 +70,17 @@ function parseInline(scanner: Scanner, options: Options) {
 			const result = tryInlineCode(scanner);
 			if (result !== null) {
 				nodes.push(result);
+				prev = ch;
+				continue;
+			}
+		}
+
+		// Mention channel
+		if (ch === '#') {
+			const result = tryChannelMention(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ch;
 				continue;
 			}
 		}
@@ -80,11 +94,13 @@ function parseInline(scanner: Scanner, options: Options) {
 
 			const text = scanner.sliceFrom(start);
 			nodes.push(plain(text));
+			prev = text[text.length - 1] ?? '';
 			continue;
 		}
 
 		// Fallback to plain text
 		nodes.push(plain(ch));
+		prev = ch;
 		scanner.consume();
 	}
 
@@ -121,6 +137,29 @@ function tryInlineCode(scanner: Scanner): Inlines | null {
 
 	scanner.consume();
 	return inlineCode(plain(content));
+}
+
+function tryChannelMention(scanner: Scanner, prev: string): Inlines | null {
+	if (prev !== '' && !isSpace(prev)) return null;
+
+	const start = scanner.position();
+	scanner.consume();
+
+	const nameStart = scanner.position();
+
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && !isSpace(scanner.char())) {
+		const c = scanner.char();
+		if (!isAlphaNum(c) && !['_', '-', '.'].includes(c)) break;
+		scanner.consume();
+	}
+
+	const name = scanner.sliceFrom(nameStart);
+	if (name.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return mentionChannel(name);
 }
 
 // ------ Block methods ----------------------------------------------------
