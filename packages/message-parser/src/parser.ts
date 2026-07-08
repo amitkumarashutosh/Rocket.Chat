@@ -123,6 +123,14 @@ function parseInline(scanner: Scanner, options: Options) {
 		}
 
 		// User mention
+		if (ch === '@') {
+			const result = tryUserMention(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ch;
+				continue;
+			}
+		}
 
 		// Mention channel
 		if (ch === '#') {
@@ -216,6 +224,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			if (result !== null) {
 				nodes.push(result);
 				prev = '_';
+				continue;
+			}
+		}
+
+		// User mention
+		if (ch === '@') {
+			const result = tryUserMention(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ch;
 				continue;
 			}
 		}
@@ -444,6 +462,35 @@ function tryChannelMention(scanner: Scanner, prev: string): Inlines | null {
 	}
 
 	return mentionChannel(name);
+}
+
+function tryUserMention(scanner: Scanner, prev: string): Inlines | null {
+	if (isAlphaNum(prev)) return null;
+
+	const start = scanner.position();
+
+	scanner.consume(); // consume '@'
+	const nameStart = scanner.position();
+
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && !isSpace(scanner.char())) {
+		const ch = scanner.char();
+		const code = ch.charCodeAt(0);
+
+		if (isAlphaNum(ch) || '._-:@'.includes(ch) || code > 127) {
+			scanner.consume();
+		} else {
+			break;
+		}
+	}
+
+	const name = scanner.sliceFrom(nameStart);
+
+	if (name.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return mentionUser(name);
 }
 
 // ------ Block methods ----------------------------------------------------
