@@ -68,6 +68,12 @@ export function parse(input: string, options: Options = {}) {
 			continue;
 		}
 
+		const blockSpoilerNode: SpoilerBlock | null = tryBlockSpoiler(scanner, options);
+		if (blockSpoilerNode !== null) {
+			root.push(blockSpoilerNode);
+			continue;
+		}
+
 		const blockquoteNode: Quote | null = tryBlockquote(scanner, options);
 		if (blockquoteNode !== null) {
 			root.push(blockquoteNode);
@@ -696,4 +702,48 @@ function tryBlockquote(scanner: Scanner, options: Options): Quote | null {
 	}
 
 	return quote(paragraphs);
+}
+
+function tryBlockSpoiler(scanner: Scanner, options: Options): SpoilerBlock | null {
+	const start = scanner.position();
+	const spoiler = '||';
+
+	// Opening line must be exactly "||"
+	if (!scanner.matches(spoiler)) {
+		return null;
+	}
+	scanner.consume(spoiler.length);
+
+	if (scanner.isEnd() || !isNewline(scanner.char())) {
+		scanner.backtrack(start); // "||" not alone on its line, or at EOF
+		return null;
+	}
+	consumeEndOfLine(scanner);
+
+	const paragraphs: Paragraph[] = [];
+	let closed = false;
+
+	while (!scanner.isEnd()) {
+		if (scanner.matches(spoiler)) {
+			const closingPos = scanner.position();
+			scanner.consume(spoiler.length);
+
+			if (scanner.isEnd() || isNewline(scanner.char())) {
+				closed = true;
+				break;
+			}
+			scanner.backtrack(closingPos); // not a closing line → treat as content
+		}
+
+		const inlines = parseInline(scanner, options);
+		paragraphs.push(paragraph(inlines));
+		consumeEndOfLine(scanner);
+	}
+
+	if (!closed || paragraphs.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return spoilerBlock(paragraphs);
 }
