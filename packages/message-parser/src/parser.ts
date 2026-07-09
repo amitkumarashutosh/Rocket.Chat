@@ -1,5 +1,5 @@
 import { isAlpha, isAlphaNum, isNewline, isPlainChar, isSpace } from './chars';
-import { Bold, Code, CodeLine, Heading, Inlines, Italic, LineBreak, Options, Root, Strike } from './index';
+import { Bold, Code, CodeLine, Heading, Inlines, Italic, LineBreak, Options, Paragraph, Quote, Root, Strike } from './index';
 import { Scanner } from './scanner';
 import {
 	bold,
@@ -13,6 +13,7 @@ import {
 	mentionUser,
 	paragraph,
 	plain,
+	quote,
 	reducePlainTexts,
 	strike,
 } from './utils';
@@ -47,6 +48,12 @@ export function parse(input: string, options: Options = {}) {
 		const codeFenceNode: Code | null = tryCodeFence(scanner);
 		if (codeFenceNode !== null) {
 			root.push(codeFenceNode);
+			continue;
+		}
+
+		const blockquoteNode: Quote | null = tryBlockquote(scanner, options);
+		if (blockquoteNode !== null) {
+			root.push(blockquoteNode);
 			continue;
 		}
 
@@ -591,4 +598,39 @@ function tryCodeFence(scanner: Scanner): Code | null {
 	}
 
 	return code(lines, language || undefined);
+}
+
+function tryBlockquote(scanner: Scanner, options: Options): Quote | null {
+	const start = scanner.position();
+
+	if (scanner.char() !== '>') {
+		return null;
+	}
+
+	const paragraphs: Paragraph[] = [];
+
+	while (!scanner.isEnd() && scanner.char() === '>') {
+		scanner.consume(); // consume '>'
+
+		// Optional space/tab after '>'
+		if (isSpace(scanner.char())) {
+			scanner.consume();
+		}
+
+		if (scanner.isEnd() || isNewline(scanner.char())) {
+			paragraphs.push(paragraph([plain('')])); // empty quoted line
+		} else {
+			const inlines = parseInline(scanner, options);
+			paragraphs.push(paragraph(inlines));
+		}
+
+		consumeEndOfLine(scanner); // Consume newline
+	}
+
+	if (paragraphs.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return quote(paragraphs);
 }
