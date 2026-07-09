@@ -1,5 +1,20 @@
 import { isAlpha, isAlphaNum, isNewline, isPlainChar, isSpace } from './chars';
-import { Bold, Code, CodeLine, Heading, Inlines, Italic, LineBreak, Options, Paragraph, Quote, Root, Strike } from './index';
+import {
+	Bold,
+	Code,
+	CodeLine,
+	Heading,
+	Inlines,
+	Italic,
+	LineBreak,
+	Options,
+	Paragraph,
+	Quote,
+	Root,
+	Spoiler,
+	SpoilerBlock,
+	Strike,
+} from './index';
 import { Scanner } from './scanner';
 import {
 	bold,
@@ -15,6 +30,8 @@ import {
 	plain,
 	quote,
 	reducePlainTexts,
+	spoiler,
+	spoilerBlock,
 	strike,
 } from './utils';
 
@@ -157,6 +174,16 @@ function parseInline(scanner: Scanner, options: Options) {
 			}
 		}
 
+		// Inline spoiler
+		if (ch === '|') {
+			const result = trySpoiler(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '|';
+				continue;
+			}
+		}
+
 		// Plain run
 		if (isPlainChar(ch)) {
 			const start = scanner.position();
@@ -259,6 +286,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			if (result !== null) {
 				nodes.push(result);
 				prev = ch;
+				continue;
+			}
+		}
+
+		// Inline spoiler
+		if (ch === '|') {
+			const result = trySpoiler(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '|';
 				continue;
 			}
 		}
@@ -506,6 +543,32 @@ function tryUserMention(scanner: Scanner, prev: string): Inlines | null {
 	}
 
 	return mentionUser(name);
+}
+
+function trySpoiler(scanner: Scanner, options: Options): Inlines | null {
+	const start = scanner.position();
+	const delimiter = '||';
+
+	// Must start with "||"
+	if (!scanner.matches(delimiter)) {
+		return null;
+	}
+	scanner.consume(delimiter.length); // consume opening "||"
+
+	const content = parseInlineContent(scanner, options, delimiter);
+
+	if (!scanner.matches(delimiter)) {
+		scanner.backtrack(start);
+		return null;
+	}
+	scanner.consume(delimiter.length); // consume closing "||"
+
+	if (content.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return spoiler(reducePlainTexts(content) as Spoiler['value']);
 }
 
 // ------ Block methods ----------------------------------------------------
