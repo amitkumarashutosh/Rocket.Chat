@@ -1,8 +1,10 @@
 import { isAlpha, isAlphaNum, isNewline, isPlainChar, isSpace } from './chars';
-import { Bold, Heading, Inlines, Italic, LineBreak, Options, Root, Strike } from './index';
+import { Bold, Code, CodeLine, Heading, Inlines, Italic, LineBreak, Options, Root, Strike } from './index';
 import { Scanner } from './scanner';
 import {
 	bold,
+	code,
+	codeLine,
 	heading,
 	inlineCode,
 	italic,
@@ -39,6 +41,12 @@ export function parse(input: string, options: Options = {}) {
 		const lineBreakNode: LineBreak | null = tryLineBreak(scanner);
 		if (lineBreakNode !== null) {
 			root.push(lineBreakNode);
+			continue;
+		}
+
+		const codeFenceNode: Code | null = tryCodeFence(scanner);
+		if (codeFenceNode !== null) {
+			root.push(codeFenceNode);
 			continue;
 		}
 
@@ -451,7 +459,7 @@ function tryChannelMention(scanner: Scanner, prev: string): Inlines | null {
 
 	while (!scanner.isEnd() && !isNewline(scanner.char()) && !isSpace(scanner.char())) {
 		const c = scanner.char();
-		if (!isAlphaNum(c) && !['_', '-', '.'].includes(c)) break;
+		if (!isAlphaNum(c) && !'_-.'.includes(c)) break;
 		scanner.consume();
 	}
 
@@ -529,4 +537,58 @@ function tryHeading(scanner: Scanner, options: Options): Heading | null {
 	const inlines = parseInline(scanner, options);
 	consumeEndOfLine(scanner);
 	return heading(inlines, level as 1 | 2 | 3 | 4);
+}
+
+function tryCodeFence(scanner: Scanner): Code | null {
+	const start = scanner.position();
+	const fence = '```';
+
+	if (!scanner.matches(fence)) {
+		return null;
+	}
+	scanner.consume(fence.length);
+
+	// Optional language tag
+	const langStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char())) {
+		scanner.consume();
+	}
+	const language = scanner.sliceFrom(langStart).trim();
+
+	// Must be followed by newline
+	if (scanner.isEnd()) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	consumeEndOfLine(scanner); // Consume newline after opening ```
+
+	const lines: CodeLine[] = [];
+	let closed = false;
+
+	while (!scanner.isEnd()) {
+		if (scanner.matches(fence)) {
+			scanner.consume(fence.length);
+			while (!scanner.isEnd() && !isNewline(scanner.char())) scanner.consume();
+			closed = true;
+			break;
+		}
+
+		const lineStart = scanner.position();
+		while (!scanner.isEnd() && !isNewline(scanner.char())) {
+			scanner.consume();
+		}
+
+		const text = scanner.sliceFrom(lineStart);
+		lines.push(codeLine(plain(text)));
+
+		consumeEndOfLine(scanner);
+	}
+
+	if (!closed) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return code(lines, language || undefined);
 }
