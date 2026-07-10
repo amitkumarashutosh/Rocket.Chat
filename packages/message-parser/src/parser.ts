@@ -1,4 +1,4 @@
-import { isAlpha, isAlphaNum, isNewline, isPlainChar, isSpace } from './chars';
+import { isAlpha, isAlphaNum, isDigit, isNewline, isPlainChar, isSpace } from './chars';
 import {
 	Bold,
 	Code,
@@ -7,13 +7,16 @@ import {
 	Inlines,
 	Italic,
 	LineBreak,
+	ListItem,
 	Options,
+	OrderedList,
 	Paragraph,
 	Quote,
 	Root,
 	Spoiler,
 	SpoilerBlock,
 	Strike,
+	UnorderedList,
 } from './index';
 import { Scanner } from './scanner';
 import {
@@ -25,8 +28,10 @@ import {
 	italic,
 	lineBreak,
 	link,
+	listItem,
 	mentionChannel,
 	mentionUser,
+	orderedList,
 	paragraph,
 	plain,
 	quote,
@@ -34,6 +39,7 @@ import {
 	spoiler,
 	spoilerBlock,
 	strike,
+	unorderedList,
 } from './utils';
 
 // ----- Constants ------------------------------------------------------------
@@ -78,6 +84,18 @@ export function parse(input: string, options: Options = {}) {
 		const blockquoteNode: Quote | null = tryBlockquote(scanner, options);
 		if (blockquoteNode !== null) {
 			root.push(blockquoteNode);
+			continue;
+		}
+
+		const unorderedListNode: UnorderedList | null = tryUnorderedList(scanner, options);
+		if (unorderedListNode !== null) {
+			root.push(unorderedListNode);
+			continue;
+		}
+
+		const orderedListNode: OrderedList | null = tryOrderedList(scanner, options);
+		if (orderedListNode !== null) {
+			root.push(orderedListNode);
 			continue;
 		}
 
@@ -719,6 +737,109 @@ function tryAngleBracketLink(scanner: Scanner): Inlines | null {
 	return link(url, [plain(title)]);
 }
 
+function tryUnorderedList(scanner: Scanner, options: Options): UnorderedList | null {
+	const start = scanner.position();
+
+	const marker = scanner.char();
+	if (marker !== '-' && marker !== '*') {
+		return null;
+	}
+
+	if (!isSpace(scanner.charAt(1))) {
+		return null;
+	}
+
+	const items: ListItem[] = [];
+
+	while (!scanner.isEnd()) {
+		const ch = scanner.char();
+		const itemStart = scanner.position();
+
+		// Stop if marker changes or line is no longer a list item
+		if (ch !== marker) break;
+		if (!isSpace(scanner.charAt(1))) break;
+
+		scanner.consume(); // consume marker
+
+		while (isSpace(scanner.char())) {
+			scanner.consume();
+		}
+
+		const inlines = parseInline(scanner, options);
+
+		// '*' is also the bold marker, so "* " or text ending in '*' is bold, not a list
+		if (marker === '*') {
+			const last = inlines[inlines.length - 1];
+			const isEmpty = inlines.length === 0;
+			const endsWithStar = last?.type === 'PLAIN_TEXT' && last.value.endsWith('*');
+
+			if (isEmpty || endsWithStar) {
+				scanner.backtrack(itemStart);
+				break;
+			}
+		}
+
+		items.push(listItem(inlines));
+
+		consumeEndOfLine(scanner);
+	}
+
+	if (items.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return unorderedList(items);
+}
+
+function tryOrderedList(scanner: Scanner, options: Options): OrderedList | null {
+	const start = scanner.position();
+
+	if (!isDigit(scanner.char())) {
+		return null;
+	}
+
+	const items: ListItem[] = [];
+
+	while (!scanner.isEnd()) {
+		if (!isDigit(scanner.char())) break;
+
+		// Collect leading digits
+		const numStart = scanner.position();
+		while (!scanner.isEnd() && isDigit(scanner.char())) {
+			scanner.consume();
+		}
+		const numStr = scanner.sliceFrom(numStart);
+
+		// Must be followed by '.' then a space
+		if (scanner.char() !== '.') {
+			scanner.backtrack(start);
+			return null;
+		}
+		scanner.consume(); // consume '.'
+
+		if (!isSpace(scanner.char())) {
+			scanner.backtrack(start);
+			return null;
+		}
+
+		while (isSpace(scanner.char())) {
+			scanner.consume();
+		}
+
+		const inlines = parseInline(scanner, options);
+		items.push(listItem(inlines, parseInt(numStr)));
+
+		consumeEndOfLine(scanner);
+	}
+
+	if (items.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return orderedList(items);
+}
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
