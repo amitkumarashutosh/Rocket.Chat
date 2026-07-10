@@ -24,6 +24,7 @@ import {
 	inlineCode,
 	italic,
 	lineBreak,
+	link,
 	mentionChannel,
 	mentionUser,
 	paragraph,
@@ -180,6 +181,25 @@ function parseInline(scanner: Scanner, options: Options) {
 			}
 		}
 
+		// Markdown link
+		if (ch === '[') {
+			const result = tryMarkdownLink(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ']';
+				continue;
+			}
+		}
+
+		if (ch === '<') {
+			const result = tryAngleBracketLink(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '>';
+				continue;
+			}
+		}
+
 		// Inline spoiler
 		if (ch === '|') {
 			const result = trySpoiler(scanner, options);
@@ -296,6 +316,26 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			}
 		}
 
+		// Markdown link
+		if (ch === '[') {
+			const result = tryMarkdownLink(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ']';
+				continue;
+			}
+		}
+
+		// Angle bracket link
+		if (ch === '<') {
+			const result = tryAngleBracketLink(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '>';
+				continue;
+			}
+		}
+
 		// Inline spoiler
 		if (ch === '|') {
 			const result = trySpoiler(scanner, options);
@@ -310,6 +350,7 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 		if (isPlainChar(ch)) {
 			const start = scanner.position();
 			while (!scanner.isEnd() && isPlainChar(scanner.char())) {
+				if (stopChar && scanner.matches(stopChar)) break;
 				scanner.consume();
 			}
 
@@ -577,6 +618,107 @@ function trySpoiler(scanner: Scanner, options: Options): Inlines | null {
 	return spoiler(reducePlainTexts(content) as Spoiler['value']);
 }
 
+function tryMarkdownLink(scanner: Scanner, options: Options): Inlines | null {
+	const start = scanner.position();
+
+	// Must start with '['
+	if (scanner.char() !== '[') {
+		return null;
+	}
+	scanner.consume(); // consume '['
+
+	// Parse title content — stops at ']'
+	const titleNodes = parseInlineContent(scanner, options, ']');
+
+	// Must find ']('
+	if (!scanner.matches('](')) {
+		scanner.backtrack(start);
+		return null;
+	}
+	scanner.consume(2); // consume ']('
+
+	// Parse URL — stops at ')'
+	const urlStart = scanner.position();
+	let depth = 1;
+	while (!scanner.isEnd() && !isNewline(scanner.char())) {
+		if (scanner.char() === '(') depth++;
+		if (scanner.char() === ')') {
+			depth--;
+			if (depth === 0) break;
+		}
+		scanner.consume();
+	}
+
+	if (!scanner.matches(')')) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	const url = scanner.sliceFrom(urlStart);
+	scanner.consume(); // consume ')'
+
+	if (url.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	const title = reducePlainTexts(titleNodes);
+
+	// Empty title → link with no label (defaults to src)
+	if (title.length === 0) {
+		return link(url);
+	}
+
+	return link(url, title as any);
+}
+
+function tryAngleBracketLink(scanner: Scanner): Inlines | null {
+	const start = scanner.position();
+
+	// Must start with '<'
+	if (scanner.char() !== '<') {
+		return null;
+	}
+	scanner.consume(); // consume '<'
+
+	// Parse URL — stops at '|' or '>'
+	const urlStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char())) {
+		if (scanner.char() === '|' || scanner.char() === '>') break;
+		scanner.consume();
+	}
+
+	const url = scanner.sliceFrom(urlStart);
+
+	if (url.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Must have '|' separator for angle bracket link
+	if (scanner.char() !== '|') {
+		scanner.backtrack(start);
+		return null;
+	}
+	scanner.consume(); // consume '|'
+
+	// Parse title — stops at '>'
+	const titleStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && scanner.char() !== '>') {
+		scanner.consume();
+	}
+
+	if (scanner.char() !== '>') {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	const title = scanner.sliceFrom(titleStart);
+	scanner.consume(); // consume '>'
+
+	return link(url, [plain(title)]);
+}
+
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
@@ -677,6 +819,7 @@ function tryBlockquote(scanner: Scanner, options: Options): Quote | null {
 	}
 
 	const paragraphs: Paragraph[] = [];
+	let hasContent = false;
 
 	while (!scanner.isEnd() && scanner.char() === '>') {
 		scanner.consume(); // consume '>'
@@ -691,12 +834,14 @@ function tryBlockquote(scanner: Scanner, options: Options): Quote | null {
 		} else {
 			const inlines = parseInline(scanner, options);
 			paragraphs.push(paragraph(inlines));
+			hasContent = true;
 		}
 
 		consumeEndOfLine(scanner); // Consume newline
 	}
 
-	if (paragraphs.length === 0) {
+	// A bare '>' with no content isn't a quote — fall back to plain text.
+	if (paragraphs.length === 0 || !hasContent) {
 		scanner.backtrack(start);
 		return null;
 	}
