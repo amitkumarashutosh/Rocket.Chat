@@ -6,6 +6,7 @@ import {
 	Heading,
 	Inlines,
 	Italic,
+	KaTeX,
 	LineBreak,
 	ListItem,
 	Options,
@@ -25,7 +26,9 @@ import {
 	codeLine,
 	heading,
 	inlineCode,
+	inlineKatex,
 	italic,
+	katex,
 	lineBreak,
 	link,
 	listItem,
@@ -66,6 +69,12 @@ export function parse(input: string, options: Options = {}) {
 		const lineBreakNode: LineBreak | null = tryLineBreak(scanner);
 		if (lineBreakNode !== null) {
 			root.push(lineBreakNode);
+			continue;
+		}
+
+		const katexBlockNode: KaTeX | null = tryKatexBlock(scanner, options);
+		if (katexBlockNode !== null) {
+			root.push(katexBlockNode);
 			continue;
 		}
 
@@ -122,6 +131,16 @@ function parseInline(scanner: Scanner, options: Options) {
 
 	while (!scanner.isEnd() && !isNewline(scanner.char())) {
 		const ch = scanner.char();
+
+		// KaTeX inline (must be before escape handler)
+		if (ch === '$' || (ch === '\\' && scanner.charAt(1) === '(')) {
+			const result = tryKatexInline(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ch;
+				continue;
+			}
+		}
 
 		// Escape sequences
 		if (ch === '\\') {
@@ -209,6 +228,7 @@ function parseInline(scanner: Scanner, options: Options) {
 			}
 		}
 
+		// Angle bracket link
 		if (ch === '<') {
 			const result = tryAngleBracketLink(scanner);
 			if (result !== null) {
@@ -257,6 +277,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 	while (!scanner.isEnd() && !isNewline(scanner.char())) {
 		if (stopChar && scanner.matches(stopChar)) break;
 		const ch = scanner.char();
+
+		// KaTeX inline (must be before escape handler)
+		if (ch === '$' || (ch === '\\' && scanner.charAt(1) === '(')) {
+			const result = tryKatexInline(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ch;
+				continue;
+			}
+		}
 
 		// Escape sequences
 		if (ch === '\\') {
@@ -840,6 +870,44 @@ function tryOrderedList(scanner: Scanner, options: Options): OrderedList | null 
 
 	return orderedList(items);
 }
+
+function tryKatexInline(scanner: Scanner, options: Options): Inlines | null {
+	const start = scanner.position();
+
+	let openDelim: string;
+	let closeDelim: string;
+
+	if (options.katex?.dollarSyntax && scanner.matches('$') && !scanner.matches('$$')) {
+		openDelim = '$';
+		closeDelim = '$';
+	} else if (options.katex?.parenthesisSyntax && scanner.matches('\\(')) {
+		openDelim = '\\(';
+		closeDelim = '\\)';
+	} else {
+		return null;
+	}
+
+	scanner.consume(openDelim.length);
+
+	const contentStart = scanner.position();
+
+	// Inline katex: no newlines allowed inside
+	while (!scanner.isEnd() && !isNewline(scanner.char())) {
+		if (scanner.matches(closeDelim)) break;
+		scanner.consume();
+	}
+
+	if (!scanner.matches(closeDelim)) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	const content = scanner.sliceFrom(contentStart);
+	scanner.consume(closeDelim.length);
+
+	return inlineKatex(content);
+}
+
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
@@ -1012,4 +1080,40 @@ function tryBlockSpoiler(scanner: Scanner, options: Options): SpoilerBlock | nul
 	}
 
 	return spoilerBlock(paragraphs);
+}
+
+function tryKatexBlock(scanner: Scanner, options: Options): KaTeX | null {
+	const start = scanner.position();
+
+	let openDelim: string;
+	let closeDelim: string;
+
+	if (options.katex?.dollarSyntax && scanner.matches('$$')) {
+		openDelim = '$$';
+		closeDelim = '$$';
+	} else if (options.katex?.parenthesisSyntax && scanner.matches('\\[')) {
+		openDelim = '\\[';
+		closeDelim = '\\]';
+	} else {
+		return null;
+	}
+
+	scanner.consume(openDelim.length);
+
+	// Collect content until closing delimiter
+	const contentStart = scanner.position();
+	while (!scanner.isEnd()) {
+		if (scanner.matches(closeDelim)) break;
+		scanner.consume();
+	}
+
+	if (!scanner.matches(closeDelim)) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	const content = scanner.sliceFrom(contentStart);
+	scanner.consume(closeDelim.length);
+
+	return katex(content);
 }
