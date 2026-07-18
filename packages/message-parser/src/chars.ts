@@ -29,3 +29,35 @@ export function isMarkupChar(ch: string): boolean {
 export function isPlainChar(ch: string): boolean {
 	return ch !== '' && !isNewline(ch) && !isMarkupChar(ch) && !isSpace(ch);
 }
+
+// ─── Emoticon ──────────────────────────────────────────────────────────────
+export const EMOTICONS: Record<string, string> = {
+	':)': 'slight_smile',
+	':-)': 'slight_smile',
+	':(': 'frowning',
+	':-(': 'frowning',
+	'D:': 'fearful',
+	':D': 'grinning',
+	':-D': 'grinning',
+	':P': 'stuck_out_tongue',
+	':-P': 'stuck_out_tongue',
+	':p': 'stuck_out_tongue',
+	':-p': 'stuck_out_tongue',
+	';)': 'wink',
+	';-)': 'wink',
+	':o': 'open_mouth',
+	':-o': 'open_mouth',
+	':O': 'open_mouth',
+	':-O': 'open_mouth',
+	':|': 'neutral_face',
+	':-|': 'neutral_face',
+	':/': 'confused',
+	':-/': 'confused',
+	':\\': 'confused',
+	':-\\': 'confused',
+	':*': 'kissing_heart',
+	'-_-': 'expressionless',
+};
+
+// Sorted longest-first so e.g. ":-D" wins over ":D", ">:-)" over ">:)".
+export const EMOTICON_KEYS = Object.keys(EMOTICONS).sort((a, b) => b.length - a.length);

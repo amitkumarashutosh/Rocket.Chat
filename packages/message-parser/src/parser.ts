@@ -1,4 +1,4 @@
-import { isAlpha, isAlphaNum, isDigit, isNewline, isPlainChar, isSpace } from './chars';
+import { EMOTICON_KEYS, EMOTICONS, isAlpha, isAlphaNum, isDigit, isNewline, isPlainChar, isSpace } from './chars';
 import {
 	BigEmoji,
 	Bold,
@@ -27,6 +27,7 @@ import {
 	code,
 	codeLine,
 	emoji,
+	emoticon,
 	heading,
 	inlineCode,
 	inlineKatex,
@@ -67,9 +68,19 @@ function isShortCodeChar(ch: string): boolean {
 	return isAlphaNum(ch) || ch === '-' || ch === '_' || ch === '+' || ch === '.';
 }
 
+export function matchEmoticon(scanner: Scanner): Inlines | null {
+	for (const key of EMOTICON_KEYS) {
+		if (scanner.matches(key)) {
+			scanner.consume(key.length);
+			return emoticon(key, EMOTICONS[key]);
+		}
+	}
+	return null;
+}
+
 // ------ Entry Point ---------------------------------------------------------
 export function parse(input: string, options: Options = {}) {
-	const bigEmojiRoot = tryBigEmoji(input);
+	const bigEmojiRoot = tryBigEmoji(input, options);
 	if (bigEmojiRoot !== null) {
 		return bigEmojiRoot;
 	}
@@ -144,7 +155,17 @@ function parseInline(scanner: Scanner, options: Options) {
 	while (!scanner.isEnd() && !isNewline(scanner.char())) {
 		const ch = scanner.char();
 
-		// KaTeX inline (must be before escape handler)
+		// Emoticons
+		if (options.emoticons) {
+			const result = tryEmoticon(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
+				continue;
+			}
+		}
+
+		// KaTeX inline
 		if (ch === '$' || (ch === '\\' && scanner.charAt(1) === '(')) {
 			const result = tryKatexInline(scanner, options);
 			if (result !== null) {
@@ -300,7 +321,17 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 		if (stopChar && scanner.matches(stopChar)) break;
 		const ch = scanner.char();
 
-		// KaTeX inline (must be before escape handler)
+		// Emoticons
+		if (options.emoticons) {
+			const result = tryEmoticon(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
+				continue;
+			}
+		}
+
+		// KaTeX inline
 		if (ch === '$' || (ch === '\\' && scanner.charAt(1) === '(')) {
 			const result = tryKatexInline(scanner, options);
 			if (result !== null) {
@@ -959,6 +990,23 @@ function tryEmojiShortCode(scanner: Scanner): Inlines | null {
 	return emoji(name);
 }
 
+export function tryEmoticon(scanner: Scanner, prev: string): Inlines | null {
+	if (prev !== '' && !isSpace(prev)) return null;
+
+	const start = scanner.position();
+
+	const node = matchEmoticon(scanner);
+	if (node === null) return null;
+
+	const after = scanner.char();
+	if (after === '' || isSpace(after) || isNewline(after) || after === '*') {
+		return node;
+	}
+
+	scanner.backtrack(start);
+	return null;
+}
+
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
@@ -1169,7 +1217,7 @@ function tryKatexBlock(scanner: Scanner, options: Options): KaTeX | null {
 	return katex(content);
 }
 
-function tryBigEmoji(input: string): [BigEmoji] | null {
+function tryBigEmoji(input: string, options: Options): [BigEmoji] | null {
 	const scanner = new Scanner(input);
 
 	const skipWhitespace = (): void => {
@@ -1182,8 +1230,13 @@ function tryBigEmoji(input: string): [BigEmoji] | null {
 
 	const emojis: Inlines[] = [];
 	while (emojis.length < 3 && !scanner.isEnd()) {
-		if (scanner.char() !== ':') return null;
-		const node = tryEmojiShortCode(scanner);
+		let node: Inlines | null = null;
+		if (scanner.char() === ':') {
+			node = tryEmojiShortCode(scanner);
+		}
+		if (node === null && options.emoticons) {
+			node = matchEmoticon(scanner);
+		}
 		if (node === null) return null;
 
 		emojis.push(node);
