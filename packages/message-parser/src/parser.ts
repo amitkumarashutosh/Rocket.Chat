@@ -27,6 +27,7 @@ import {
 	code,
 	codeLine,
 	emoji,
+	emojiUnicode,
 	emoticon,
 	heading,
 	inlineCode,
@@ -51,6 +52,7 @@ import {
 
 // ----- Constants ------------------------------------------------------------
 const ESCAPABLE = new Set(['*', '_', '~', '#', '.', '`']);
+const UNICODE_EMOJI = new RegExp('^\\p{RGI_Emoji}\\uFE0F?', 'v');
 
 // ----- Re-entrancy guards  --------------------------------------------------
 let skipBold = false;
@@ -241,6 +243,16 @@ function parseInline(scanner: Scanner, options: Options) {
 			}
 		}
 
+		// Unicode raw emoji
+		if (ch.charCodeAt(0) > 127) {
+			const result = tryUnicodeEmoji(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
+				continue;
+			}
+		}
+
 		// User mention
 		if (ch === '@') {
 			const result = tryUserMention(scanner, prev);
@@ -403,6 +415,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			if (result !== null) {
 				nodes.push(result);
 				prev = ':';
+				continue;
+			}
+		}
+
+		//  Unicode raw emoji
+		if (ch.charCodeAt(0) > 127) {
+			const result = tryUnicodeEmoji(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
 				continue;
 			}
 		}
@@ -1007,6 +1029,24 @@ export function tryEmoticon(scanner: Scanner, prev: string): Inlines | null {
 	return null;
 }
 
+function tryUnicodeEmoji(scanner: Scanner): Inlines | null {
+	const ch = scanner.char();
+	if (ch === '' || ch.charCodeAt(0) <= 127) return null; // fast-reject ASCII
+
+	let window = '';
+	for (let i = 0; i < 32; i++) {
+		const c = scanner.charAt(i);
+		if (c === '') break;
+		window += c;
+	}
+
+	const m = UNICODE_EMOJI.exec(window);
+	if (m === null) return null;
+
+	scanner.consume(m[0].length);
+	return emojiUnicode(m[0]);
+}
+
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
@@ -1231,8 +1271,12 @@ function tryBigEmoji(input: string, options: Options): [BigEmoji] | null {
 	const emojis: Inlines[] = [];
 	while (emojis.length < 3 && !scanner.isEnd()) {
 		let node: Inlines | null = null;
+
 		if (scanner.char() === ':') {
 			node = tryEmojiShortCode(scanner);
+		}
+		if (node === null) {
+			node = tryUnicodeEmoji(scanner);
 		}
 		if (node === null && options.emoticons) {
 			node = matchEmoticon(scanner);
