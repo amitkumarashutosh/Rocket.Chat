@@ -27,5 +27,5 @@ export function isMarkupChar(ch: string): boolean {
 }
 
 export function isPlainChar(ch: string): boolean {
-	return ch !== '' && !isNewline(ch) && !isMarkupChar(ch);
+	return ch !== '' && !isNewline(ch) && !isMarkupChar(ch) && !isSpace(ch);
 }

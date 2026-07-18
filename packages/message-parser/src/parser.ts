@@ -1,5 +1,6 @@
 import { isAlpha, isAlphaNum, isDigit, isNewline, isPlainChar, isSpace } from './chars';
 import {
+	BigEmoji,
 	Bold,
 	Code,
 	CodeLine,
@@ -21,9 +22,11 @@ import {
 } from './index';
 import { Scanner } from './scanner';
 import {
+	bigEmoji,
 	bold,
 	code,
 	codeLine,
+	emoji,
 	heading,
 	inlineCode,
 	inlineKatex,
@@ -60,8 +63,17 @@ function consumeEndOfLine(s: Scanner): void {
 	else s.consume(1);
 }
 
+function isShortCodeChar(ch: string): boolean {
+	return isAlphaNum(ch) || ch === '-' || ch === '_' || ch === '+' || ch === '.';
+}
+
 // ------ Entry Point ---------------------------------------------------------
 export function parse(input: string, options: Options = {}) {
+	const bigEmojiRoot = tryBigEmoji(input);
+	if (bigEmojiRoot !== null) {
+		return bigEmojiRoot;
+	}
+
 	const root: Root = [];
 	const scanner = new Scanner(input);
 
@@ -194,6 +206,16 @@ function parseInline(scanner: Scanner, options: Options) {
 			if (result !== null) {
 				nodes.push(result);
 				prev = '_';
+				continue;
+			}
+		}
+
+		// Emoji shortcode (:smile:)
+		if (ch === ':') {
+			const result = tryEmojiShortCode(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ':';
 				continue;
 			}
 		}
@@ -340,6 +362,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			if (result !== null) {
 				nodes.push(result);
 				prev = '_';
+				continue;
+			}
+		}
+
+		// Emoji shortcode (:smile:)
+		if (ch === ':') {
+			const result = tryEmojiShortCode(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = ':';
 				continue;
 			}
 		}
@@ -908,6 +940,25 @@ function tryKatexInline(scanner: Scanner, options: Options): Inlines | null {
 	return inlineKatex(content);
 }
 
+function tryEmojiShortCode(scanner: Scanner): Inlines | null {
+	const start = scanner.position();
+	scanner.consume(); // consume opening ':'
+
+	const nameStart = scanner.position();
+	while (!scanner.isEnd() && isShortCodeChar(scanner.char())) {
+		scanner.consume();
+	}
+
+	const name = scanner.sliceFrom(nameStart);
+	if (name.length === 0 || scanner.char() !== ':') {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	scanner.consume(); // consume closing ':'
+	return emoji(name);
+}
+
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
@@ -1116,4 +1167,30 @@ function tryKatexBlock(scanner: Scanner, options: Options): KaTeX | null {
 	scanner.consume(closeDelim.length);
 
 	return katex(content);
+}
+
+function tryBigEmoji(input: string): [BigEmoji] | null {
+	const scanner = new Scanner(input);
+
+	const skipWhitespace = (): void => {
+		while (!scanner.isEnd() && (isSpace(scanner.char()) || isNewline(scanner.char()))) {
+			scanner.consume();
+		}
+	};
+
+	skipWhitespace();
+
+	const emojis: Inlines[] = [];
+	while (emojis.length < 3 && !scanner.isEnd()) {
+		if (scanner.char() !== ':') return null;
+		const node = tryEmojiShortCode(scanner);
+		if (node === null) return null;
+
+		emojis.push(node);
+		skipWhitespace();
+	}
+
+	// Whole input must be nothing but 1-3 emojis + whitespace
+	if (emojis.length === 0 || !scanner.isEnd()) return null;
+	return [bigEmoji(emojis as BigEmoji['value'])];
 }
