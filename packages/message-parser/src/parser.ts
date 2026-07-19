@@ -1,4 +1,4 @@
-import { EMOTICON_KEYS, EMOTICONS, isAlpha, isAlphaNum, isDigit, isNewline, isPlainChar, isSpace } from './chars';
+import { EMOTICON_KEYS, EMOTICONS, isAlpha, isAlphaNum, isDigit, isEmojiStart, isNewline, isPlainChar, isSpace, isUrlStart } from './chars';
 import {
 	BigEmoji,
 	Bold,
@@ -22,6 +22,7 @@ import {
 } from './index';
 import { Scanner } from './scanner';
 import {
+	autoLink,
 	bigEmoji,
 	bold,
 	code,
@@ -228,7 +229,7 @@ function parseInline(scanner: Scanner, options: Options) {
 			const result = tryItalic(scanner, options, prev);
 			if (result !== null) {
 				nodes.push(result);
-				prev = '_';
+				prev = ch;
 				continue;
 			}
 		}
@@ -238,13 +239,13 @@ function parseInline(scanner: Scanner, options: Options) {
 			const result = tryEmojiShortCode(scanner);
 			if (result !== null) {
 				nodes.push(result);
-				prev = ':';
+				prev = ch;
 				continue;
 			}
 		}
 
 		// Unicode raw emoji
-		if (ch.charCodeAt(0) > 127) {
+		if (isEmojiStart(ch)) {
 			const result = tryUnicodeEmoji(scanner);
 			if (result !== null) {
 				nodes.push(result);
@@ -298,7 +299,17 @@ function parseInline(scanner: Scanner, options: Options) {
 			const result = trySpoiler(scanner, options);
 			if (result !== null) {
 				nodes.push(result);
-				prev = '|';
+				prev = ch;
+				continue;
+			}
+		}
+
+		// Auto link
+		if (isUrlStart(ch)) {
+			const result = tryAutoLinkUrl(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
 				continue;
 			}
 		}
@@ -404,7 +415,7 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			const result = tryItalic(scanner, options, prev);
 			if (result !== null) {
 				nodes.push(result);
-				prev = '_';
+				prev = ch;
 				continue;
 			}
 		}
@@ -414,13 +425,13 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			const result = tryEmojiShortCode(scanner);
 			if (result !== null) {
 				nodes.push(result);
-				prev = ':';
+				prev = ch;
 				continue;
 			}
 		}
 
 		//  Unicode raw emoji
-		if (ch.charCodeAt(0) > 127) {
+		if (isEmojiStart(ch)) {
 			const result = tryUnicodeEmoji(scanner);
 			if (result !== null) {
 				nodes.push(result);
@@ -474,7 +485,17 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			const result = trySpoiler(scanner, options);
 			if (result !== null) {
 				nodes.push(result);
-				prev = '|';
+				prev = ch;
+				continue;
+			}
+		}
+
+		// Auto link
+		if (isUrlStart(ch)) {
+			const result = tryAutoLinkUrl(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
 				continue;
 			}
 		}
@@ -1290,4 +1311,57 @@ function tryBigEmoji(input: string, options: Options): [BigEmoji] | null {
 	// Whole input must be nothing but 1-3 emojis + whitespace
 	if (emojis.length === 0 || !scanner.isEnd()) return null;
 	return [bigEmoji(emojis as BigEmoji['value'])];
+}
+
+function tryAutoLinkUrl(scanner: Scanner, options: Options): Inlines | null {
+	// A bare URL or domain always begins with a letter or digit.
+	const ch = scanner.char();
+	if (!isAlpha(ch) && !isDigit(ch)) return null;
+
+	const start = scanner.position();
+
+	// Collect the full URL token — everything until whitespace or end
+	const tokenStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && !isSpace(scanner.char())) {
+		scanner.consume();
+	}
+
+	const token = scanner.sliceFrom(tokenStart);
+	if (token.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Must contain '://' or '.' to be worth trying
+	if (!token.includes('://') && !token.includes('.')) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Strip trailing punctuation that shouldn't be part of URL
+	// e.g. "rocket.chat." → "rocket.chat"
+	let url = token;
+	while (url.length > 0 && '.,!?;:)'.includes(url[url.length - 1])) {
+		url = url.slice(0, -1);
+	}
+
+	if (url.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Restore scanner to end of actual url (not trailing punct)
+	scanner.backtrack(tokenStart);
+	scanner.consume(url.length);
+
+	// Use autoLink from utils which validates via tldts
+	const result = autoLink(url, options.customDomains);
+
+	// autoLink returns plain() if domain is invalid
+	if (result.type === 'PLAIN_TEXT') {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return result;
 }
