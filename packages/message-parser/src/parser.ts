@@ -22,6 +22,7 @@ import {
 } from './index';
 import { Scanner } from './scanner';
 import {
+	autoEmail,
 	autoLink,
 	bigEmoji,
 	bold,
@@ -79,6 +80,14 @@ export function matchEmoticon(scanner: Scanner): Inlines | null {
 		}
 	}
 	return null;
+}
+
+function isEmailLocalChar(ch: string): boolean {
+	return isAlphaNum(ch) || ch.charCodeAt(0) > 127 || ch === '.' || ch === '_' || ch === '+' || ch === '-' || ch === "'";
+}
+
+function isEmailDomainChar(ch: string): boolean {
+	return isAlphaNum(ch) || ch.charCodeAt(0) > 127 || ch === '.' || ch === '-';
 }
 
 // ------ Entry Point ---------------------------------------------------------
@@ -256,10 +265,20 @@ function parseInline(scanner: Scanner, options: Options) {
 
 		// User mention
 		if (ch === '@') {
-			const result = tryUserMention(scanner, prev);
-			if (result !== null) {
-				nodes.push(result);
+			const mention = tryUserMention(scanner, prev);
+			if (mention !== null) {
+				nodes.push(mention);
 				prev = ch;
+				continue;
+			}
+		}
+
+		// Email (local@domain)
+		if (isUrlStart(ch) || ch.charCodeAt(0) > 127) {
+			const email = tryEmail(scanner);
+			if (email !== null) {
+				nodes.push(email);
+				prev = '';
 				continue;
 			}
 		}
@@ -442,10 +461,20 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 
 		// User mention
 		if (ch === '@') {
-			const result = tryUserMention(scanner, prev);
-			if (result !== null) {
-				nodes.push(result);
+			const mention = tryUserMention(scanner, prev);
+			if (mention !== null) {
+				nodes.push(mention);
 				prev = ch;
+				continue;
+			}
+		}
+
+		// Email (local@domain)
+		if (isUrlStart(ch) || ch.charCodeAt(0) > 127) {
+			const email = tryEmail(scanner);
+			if (email !== null) {
+				nodes.push(email);
+				prev = '';
 				continue;
 			}
 		}
@@ -1068,6 +1097,106 @@ function tryUnicodeEmoji(scanner: Scanner): Inlines | null {
 	return emojiUnicode(m[0]);
 }
 
+function tryAutoLinkUrl(scanner: Scanner, options: Options): Inlines | null {
+	// A bare URL or domain always begins with a letter or digit.
+	const ch = scanner.char();
+	if (!isAlpha(ch) && !isDigit(ch)) return null;
+
+	const start = scanner.position();
+
+	// Collect the full URL token — everything until whitespace or end
+	const tokenStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && !isSpace(scanner.char())) {
+		scanner.consume();
+	}
+
+	const token = scanner.sliceFrom(tokenStart);
+	if (token.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Must contain '://' or '.' to be worth trying
+	if (!token.includes('://') && !token.includes('.')) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Strip trailing punctuation that shouldn't be part of URL
+	// e.g. "rocket.chat." → "rocket.chat"
+	let url = token;
+	while (url.length > 0 && '.,!?;:)'.includes(url[url.length - 1])) {
+		url = url.slice(0, -1);
+	}
+
+	if (url.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// Restore scanner to end of actual url (not trailing punct)
+	scanner.backtrack(tokenStart);
+	scanner.consume(url.length);
+
+	// Use autoLink from utils which validates via tldts
+	const result = autoLink(url, options.customDomains);
+
+	// autoLink returns plain() if domain is invalid
+	if (result.type === 'PLAIN_TEXT') {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return result;
+}
+
+function tryEmail(scanner: Scanner): Inlines | null {
+	const start = scanner.position();
+	const delimiter = 'mailto:';
+
+	// Optional "mailto:" prefix — consumed, but NOT part of the captured address
+	if (scanner.matches(delimiter)) {
+		scanner.consume(delimiter.length);
+	}
+
+	// Local part: alphanumeric / unicode, plus  . _ + - '
+	const localStart = scanner.position();
+	while (!scanner.isEnd() && isEmailLocalChar(scanner.char())) {
+		scanner.consume();
+	}
+	const local = scanner.sliceFrom(localStart);
+
+	// Must have a non-empty local part immediately followed by '@'
+	if (local.length === 0 || scanner.char() !== '@') {
+		scanner.backtrack(start);
+		return null;
+	}
+	scanner.consume(); // consume '@'
+
+	// Domain: alphanumeric / unicode, plus  . -
+	const domainStart = scanner.position();
+	while (!scanner.isEnd() && isEmailDomainChar(scanner.char())) {
+		scanner.consume();
+	}
+
+	// Trim trailing '.' / '-' back out of the domain ("joe.com." → "joe.com")
+	while (scanner.position() > domainStart && (scanner.charAt(-1) === '.' || scanner.charAt(-1) === '-')) {
+		scanner.consume(-1);
+	}
+
+	const domain = scanner.sliceFrom(domainStart);
+
+	// Domain must contain a dot that is not at the very start or end
+	const dotIdx = domain.indexOf('.');
+	if (dotIdx <= 0 || dotIdx === domain.length - 1) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	// autoEmail validates the TLD via tldts (same logic the grammar uses):
+	return autoEmail(local + '@' + domain);
+}
+
 // ------ Block methods ----------------------------------------------------
 
 function tryHeading(scanner: Scanner, options: Options): Heading | null {
@@ -1311,57 +1440,4 @@ function tryBigEmoji(input: string, options: Options): [BigEmoji] | null {
 	// Whole input must be nothing but 1-3 emojis + whitespace
 	if (emojis.length === 0 || !scanner.isEnd()) return null;
 	return [bigEmoji(emojis as BigEmoji['value'])];
-}
-
-function tryAutoLinkUrl(scanner: Scanner, options: Options): Inlines | null {
-	// A bare URL or domain always begins with a letter or digit.
-	const ch = scanner.char();
-	if (!isAlpha(ch) && !isDigit(ch)) return null;
-
-	const start = scanner.position();
-
-	// Collect the full URL token — everything until whitespace or end
-	const tokenStart = scanner.position();
-	while (!scanner.isEnd() && !isNewline(scanner.char()) && !isSpace(scanner.char())) {
-		scanner.consume();
-	}
-
-	const token = scanner.sliceFrom(tokenStart);
-	if (token.length === 0) {
-		scanner.backtrack(start);
-		return null;
-	}
-
-	// Must contain '://' or '.' to be worth trying
-	if (!token.includes('://') && !token.includes('.')) {
-		scanner.backtrack(start);
-		return null;
-	}
-
-	// Strip trailing punctuation that shouldn't be part of URL
-	// e.g. "rocket.chat." → "rocket.chat"
-	let url = token;
-	while (url.length > 0 && '.,!?;:)'.includes(url[url.length - 1])) {
-		url = url.slice(0, -1);
-	}
-
-	if (url.length === 0) {
-		scanner.backtrack(start);
-		return null;
-	}
-
-	// Restore scanner to end of actual url (not trailing punct)
-	scanner.backtrack(tokenStart);
-	scanner.consume(url.length);
-
-	// Use autoLink from utils which validates via tldts
-	const result = autoLink(url, options.customDomains);
-
-	// autoLink returns plain() if domain is invalid
-	if (result.type === 'PLAIN_TEXT') {
-		scanner.backtrack(start);
-		return null;
-	}
-
-	return result;
 }

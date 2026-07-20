@@ -23,7 +23,7 @@ export function isAlphaNum(ch: string): boolean {
 }
 
 export function isMarkupChar(ch: string): boolean {
-	return '*_~`#@:|\\[!<$+'.includes(ch);
+	return '*_~`#@:|\\[!<$+()'.includes(ch);
 }
 
 export function isPlainChar(ch: string): boolean {
