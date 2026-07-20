@@ -30,6 +30,7 @@ import {
 	Spoiler,
 	SpoilerBlock,
 	Strike,
+	Timestamp,
 	UnorderedList,
 } from './index';
 import { Scanner } from './scanner';
@@ -63,12 +64,22 @@ import {
 	spoiler,
 	spoilerBlock,
 	strike,
+	timestamp,
+	timestampFromHours,
+	timestampFromIsoTime,
 	unorderedList,
 } from './utils';
 
 // ----- Constants ------------------------------------------------------------
 const ESCAPABLE = new Set(['*', '_', '~', '#', '.', '`']);
 const UNICODE_EMOJI = new RegExp('^\\p{RGI_Emoji}\\uFE0F?', 'v');
+
+const TS_TZ = '([+-]\\d{2}:\\d{2})?'; // optional "+00:00" style offset
+const TS_UNIX = /^\d{10}$/; // exactly 10 digits
+const TS_ISO_MS = new RegExp(`^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})\\.(\\d{3})${TS_TZ}$`);
+const TS_ISO = new RegExp(`^(\\d{4})-(\\d{2})-(\\d{2})T(\\d{2}):(\\d{2}):(\\d{2})${TS_TZ}$`);
+const TS_HMS = new RegExp(`^(\\d{2}):(\\d{2}):(\\d{2})${TS_TZ}$`);
+const TS_HM = new RegExp(`^(\\d{2}):(\\d{2})${TS_TZ}$`);
 
 // ----- Re-entrancy guards  --------------------------------------------------
 let skipBold = false;
@@ -352,11 +363,18 @@ function parseInline(scanner: Scanner, options: Options) {
 			}
 		}
 
-		// Angle bracket link
+		// Angle bracket link or Timestamp
 		if (ch === '<') {
-			const result = tryAngleBracketLink(scanner);
-			if (result !== null) {
-				nodes.push(result);
+			const ts = tryTimestamp(scanner);
+			if (ts !== null) {
+				nodes.push(ts);
+				prev = '';
+				continue;
+			}
+
+			const link = tryAngleBracketLink(scanner);
+			if (link !== null) {
+				nodes.push(link);
 				prev = '>';
 				continue;
 			}
@@ -568,11 +586,18 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			}
 		}
 
-		// Angle bracket link
+		// Angle bracket link or Timestamp
 		if (ch === '<') {
-			const result = tryAngleBracketLink(scanner);
-			if (result !== null) {
-				nodes.push(result);
+			const ts = tryTimestamp(scanner);
+			if (ts !== null) {
+				nodes.push(ts);
+				prev = '';
+				continue;
+			}
+
+			const link = tryAngleBracketLink(scanner);
+			if (link !== null) {
+				nodes.push(link);
 				prev = '>';
 				continue;
 			}
@@ -1341,6 +1366,63 @@ function tryPhone(scanner: Scanner, prev: string): Inlines | null {
 	}
 
 	return link('tel:' + digits, [plain(raw)]);
+}
+
+function tryTimestamp(scanner: Scanner): Inlines | null {
+	const start = scanner.position();
+	if (!scanner.matches('<t:')) return null;
+	scanner.consume(3); // consume '<t:'
+
+	// Grab everything up to the closing '>'
+	const contentStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && scanner.char() !== '>') {
+		scanner.consume();
+	}
+	if (scanner.char() !== '>') {
+		scanner.backtrack(start);
+		return null;
+	}
+	const content = scanner.sliceFrom(contentStart);
+
+	// Optional ":format" — a single valid format letter right before '>'
+	let format: Timestamp['value']['format'] | undefined;
+	let payload = content;
+	if (content.length >= 2 && content[content.length - 2] === ':' && 'tTdDfFR'.includes(content[content.length - 1])) {
+		format = content[content.length - 1] as Timestamp['value']['format'];
+		payload = content.slice(0, content.length - 2);
+	}
+
+	// Convert the payload to a unix-seconds string (same order as the grammar).
+	let date: string | null = null;
+	let m: RegExpExecArray | null;
+	if (TS_UNIX.test(payload)) {
+		date = payload;
+	} else if ((m = TS_ISO_MS.exec(payload))) {
+		date = timestampFromIsoTime({
+			year: m[1],
+			month: m[2],
+			day: m[3],
+			hours: m[4],
+			minutes: m[5],
+			seconds: m[6],
+			milliseconds: m[7],
+			timezone: m[8],
+		});
+	} else if ((m = TS_ISO.exec(payload))) {
+		date = timestampFromIsoTime({ year: m[1], month: m[2], day: m[3], hours: m[4], minutes: m[5], seconds: m[6], timezone: m[7] });
+	} else if ((m = TS_HMS.exec(payload))) {
+		date = timestampFromHours(m[1], m[2], m[3], m[4]);
+	} else if ((m = TS_HM.exec(payload))) {
+		date = timestampFromHours(m[1], m[2], undefined, m[3]);
+	}
+
+	if (date === null) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	scanner.consume(); // consume '>'
+	return timestamp(date, format, [start, scanner.position()]);
 }
 
 // ------ Block methods ----------------------------------------------------
