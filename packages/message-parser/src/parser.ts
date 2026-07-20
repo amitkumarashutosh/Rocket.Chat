@@ -18,6 +18,7 @@ import {
 	Code,
 	CodeLine,
 	Heading,
+	HorizontalRule,
 	Inlines,
 	Italic,
 	KaTeX,
@@ -48,6 +49,7 @@ import {
 	emojiUnicode,
 	emoticon,
 	heading,
+	horizontalRule,
 	image,
 	inlineCode,
 	inlineKatex,
@@ -173,6 +175,12 @@ export function parse(input: string, options: Options = {}) {
 		const blockquoteNode: Quote | null = tryBlockquote(scanner, options);
 		if (blockquoteNode !== null) {
 			root.push(blockquoteNode);
+			continue;
+		}
+
+		const horizontalRuleNode: HorizontalRule | null = tryHorizontalRule(scanner);
+		if (horizontalRuleNode !== null) {
+			root.push(horizontalRuleNode);
 			continue;
 		}
 
@@ -1776,7 +1784,7 @@ function tryTasks(scanner: Scanner, options: Options): Tasks | null {
 		while (isSpace(scanner.char())) scanner.consume();
 
 		const inlines = parseInline(scanner, options);
-		items.push(task(inlines, flag === 'x'));
+		items.push(task(inlines, flag === 'x') as any);
 
 		consumeEndOfLine(scanner);
 	}
@@ -1786,5 +1794,31 @@ function tryTasks(scanner: Scanner, options: Options): Tasks | null {
 		return null;
 	}
 
-	return tasks(items);
+	return tasks(items as any);
+}
+
+function tryHorizontalRule(scanner: Scanner): HorizontalRule | null {
+	const start = scanner.position();
+
+	while (isSpace(scanner.char())) scanner.consume(); // leading spaces/tabs
+
+	// Need at least three dashes — nothing else counts as a rule.
+	const dashStart = scanner.position();
+	while (scanner.char() === '-') scanner.consume();
+	const dashEnd = scanner.position();
+	if (dashEnd - dashStart < 3) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	while (isSpace(scanner.char())) scanner.consume(); // trailing spaces/tabs
+
+	// The rest of the line must be empty.
+	if (!scanner.isEnd() && !isNewline(scanner.char())) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	consumeEndOfLine(scanner);
+	return horizontalRule([dashStart, dashEnd]);
 }
