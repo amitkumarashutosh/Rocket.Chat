@@ -17,6 +17,7 @@ import {
 	Code,
 	CodeLine,
 	Heading,
+	HorizontalRule,
 	Inlines,
 	Italic,
 	KaTeX,
@@ -46,6 +47,8 @@ import {
 	emojiUnicode,
 	emoticon,
 	heading,
+	horizontalRule,
+	image,
 	inlineCode,
 	inlineKatex,
 	italic,
@@ -353,6 +356,16 @@ function parseInline(scanner: Scanner, options: Options) {
 			}
 		}
 
+		// Image
+		if (ch === '!') {
+			const result = tryImage(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
+				continue;
+			}
+		}
+
 		// Markdown link
 		if (ch === '[') {
 			const result = tryMarkdownLink(scanner, options);
@@ -572,6 +585,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			if (result !== null) {
 				nodes.push(result);
 				prev = ch;
+				continue;
+			}
+		}
+
+		// Image
+		if (ch === '!') {
+			const result = tryImage(scanner);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
 				continue;
 			}
 		}
@@ -1365,7 +1388,8 @@ function tryPhone(scanner: Scanner, prev: string): Inlines | null {
 		return null;
 	}
 
-	return link('tel:' + digits, [plain(raw)]);
+	// return link('tel:' + digits, [plain(raw)]);
+	return phoneChecker(raw, digits);
 }
 
 function tryTimestamp(scanner: Scanner): Inlines | null {
@@ -1423,6 +1447,52 @@ function tryTimestamp(scanner: Scanner): Inlines | null {
 
 	scanner.consume(); // consume '>'
 	return timestamp(date, format, [start, scanner.position()]);
+}
+
+function tryImage(scanner: Scanner): Inlines | null {
+	const start = scanner.position();
+
+	if (!scanner.matches('![')) return null;
+	scanner.consume(2); // consume '!['
+
+	// Alt text — literal, up to ']'
+	const titleStart = scanner.position();
+	while (!scanner.isEnd() && !isNewline(scanner.char()) && scanner.char() !== ']') {
+		scanner.consume();
+	}
+	const title = scanner.sliceFrom(titleStart);
+
+	if (!scanner.matches('](')) {
+		scanner.backtrack(start);
+		return null;
+	}
+	scanner.consume(2); // consume ']('
+
+	// URL — up to the matching ')'
+	const urlStart = scanner.position();
+	let depth = 1;
+	while (!scanner.isEnd() && !isNewline(scanner.char())) {
+		if (scanner.char() === '(') depth++;
+		if (scanner.char() === ')') {
+			depth--;
+			if (depth === 0) break;
+		}
+		scanner.consume();
+	}
+
+	if (scanner.char() !== ')') {
+		scanner.backtrack(start);
+		return null;
+	}
+	const href = scanner.sliceFrom(urlStart);
+	scanner.consume(); // consume ')'
+
+	if (href.length === 0) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return title.length > 0 ? image(href, plain(title)) : image(href);
 }
 
 // ------ Block methods ----------------------------------------------------
