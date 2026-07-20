@@ -1,4 +1,16 @@
-import { EMOTICON_KEYS, EMOTICONS, isAlpha, isAlphaNum, isDigit, isEmojiStart, isNewline, isPlainChar, isSpace, isUrlStart } from './chars';
+import {
+	EMOTICON_KEYS,
+	EMOTICONS,
+	isAlpha,
+	isAlphaNum,
+	isDigit,
+	isEmojiStart,
+	isHexDigit,
+	isNewline,
+	isPlainChar,
+	isSpace,
+	isUrlStart,
+} from './chars';
 import {
 	BigEmoji,
 	Bold,
@@ -28,6 +40,7 @@ import {
 	bold,
 	code,
 	codeLine,
+	color,
 	emoji,
 	emojiUnicode,
 	emoticon,
@@ -88,6 +101,17 @@ function isEmailLocalChar(ch: string): boolean {
 
 function isEmailDomainChar(ch: string): boolean {
 	return isAlphaNum(ch) || ch.charCodeAt(0) > 127 || ch === '.' || ch === '-';
+}
+
+function isAnyText(ch: string): boolean {
+	if (ch === '') return false;
+	return (
+		(ch >= ' ' && ch <= "'") || // space ! " # $ % & '
+		(ch >= '+' && ch <= '@') || // + , - . / 0-9 : ; < = > ? @
+		(ch >= 'A' && ch <= 'Z') || // A-Z
+		(ch >= 'a' && ch <= 'z') || // a-z
+		ch.charCodeAt(0) > 127 // any non-ASCII character
+	);
 }
 
 // ------ Entry Point ---------------------------------------------------------
@@ -259,6 +283,16 @@ function parseInline(scanner: Scanner, options: Options) {
 			if (result !== null) {
 				nodes.push(result);
 				prev = '';
+				continue;
+			}
+		}
+
+		// Color (color:#rgb / rgba / rrggbb / rrggbbaa)
+		if (scanner.matches('color:#')) {
+			const result = tryColor(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prevChar = '';
 				continue;
 			}
 		}
@@ -455,6 +489,16 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			if (result !== null) {
 				nodes.push(result);
 				prev = '';
+				continue;
+			}
+		}
+
+		// Color (color:#rgb / rgba / rrggbb / rrggbbaa)
+		if (scanner.matches('color:#')) {
+			const result = tryColor(scanner, options);
+			if (result !== null) {
+				nodes.push(result);
+				prevChar = '';
 				continue;
 			}
 		}
@@ -1195,6 +1239,44 @@ function tryEmail(scanner: Scanner): Inlines | null {
 
 	// autoEmail validates the TLD via tldts (same logic the grammar uses):
 	return autoEmail(local + '@' + domain);
+}
+
+function tryColor(scanner: Scanner, options: Options): Inlines | null {
+	if (!options.colors) return null;
+	const delimiter = 'color:#';
+
+	if (!scanner.matches(delimiter)) return null;
+
+	const startPos = scanner.position();
+	scanner.consume(delimiter.length); // consume "color:#"
+
+	const hexStart = scanner.position();
+	while (!scanner.isEnd() && isHexDigit(scanner.char())) {
+		scanner.consume();
+	}
+	const hex = scanner.sliceFrom(hexStart);
+
+	let rgba: [number, number, number, number] | null = null;
+
+	if (hex.length === 6 || hex.length === 8) {
+		// byte pairs: c7 -> 0xc7
+		const b: number[] = [];
+		for (let i = 0; i < hex.length; i += 2) b.push(parseInt(hex.slice(i, i + 2), 16));
+		rgba = [b[0], b[1], b[2], b[3] ?? 255];
+	} else if (hex.length === 3 || hex.length === 4) {
+		// single nibbles doubled: c -> cc -> 0xcc
+		const n: number[] = [];
+		for (let i = 0; i < hex.length; i++) n.push(parseInt(hex[i] + hex[i], 16));
+		rgba = [n[0], n[1], n[2], n[3] ?? 255];
+	}
+
+	// Invalid digit count, or color is immediately followed by text -> not a color.
+	if (rgba === null || isAnyText(scanner.char())) {
+		scanner.backtrack(startPos);
+		return null;
+	}
+
+	return color(rgba[0], rgba[1], rgba[2], rgba[3]);
 }
 
 // ------ Block methods ----------------------------------------------------
