@@ -56,6 +56,7 @@ import {
 	mentionUser,
 	orderedList,
 	paragraph,
+	phoneChecker,
 	plain,
 	quote,
 	reducePlainTexts,
@@ -112,6 +113,10 @@ function isAnyText(ch: string): boolean {
 		(ch >= 'a' && ch <= 'z') || // a-z
 		ch.charCodeAt(0) > 127 // any non-ASCII character
 	);
+}
+
+function isPhoneChar(ch: string): boolean {
+	return isDigit(ch) || ch === '(' || ch === ')' || ch === '-';
 }
 
 // ------ Entry Point ---------------------------------------------------------
@@ -292,7 +297,17 @@ function parseInline(scanner: Scanner, options: Options) {
 			const result = tryColor(scanner, options);
 			if (result !== null) {
 				nodes.push(result);
-				prevChar = '';
+				prev = '';
+				continue;
+			}
+		}
+
+		// Phone (+number)
+		if (ch === '+') {
+			const result = tryPhone(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
 				continue;
 			}
 		}
@@ -498,7 +513,17 @@ function parseInlineContent(scanner: Scanner, options: Options, stopChar: string
 			const result = tryColor(scanner, options);
 			if (result !== null) {
 				nodes.push(result);
-				prevChar = '';
+				prev = '';
+				continue;
+			}
+		}
+
+		// Phone (+number)
+		if (ch === '+') {
+			const result = tryPhone(scanner, prev);
+			if (result !== null) {
+				nodes.push(result);
+				prev = '';
 				continue;
 			}
 		}
@@ -881,12 +906,23 @@ function tryMarkdownLink(scanner: Scanner, options: Options): Inlines | null {
 		return null;
 	}
 
-	const url = scanner.sliceFrom(urlStart);
+	let url = scanner.sliceFrom(urlStart);
 	scanner.consume(); // consume ')'
 
 	if (url.length === 0) {
 		scanner.backtrack(start);
 		return null;
+	}
+
+	// A phone number in the URL position becomes a tel: link.
+	if (url[0] === '+') {
+		let digits = '';
+		for (const ch of url) {
+			if (isDigit(ch)) digits += ch;
+		}
+		if (digits.length >= 5) {
+			url = 'tel:' + digits;
+		}
 	}
 
 	const title = reducePlainTexts(titleNodes);
@@ -1277,6 +1313,34 @@ function tryColor(scanner: Scanner, options: Options): Inlines | null {
 	}
 
 	return color(rgba[0], rgba[1], rgba[2], rgba[3]);
+}
+
+function tryPhone(scanner: Scanner, prev: string): Inlines | null {
+	// A phone number starts with '+' at the start of text or right after a space.
+	if (prev !== '' && !isSpace(prev)) return null;
+
+	const start = scanner.position();
+	scanner.consume(); // consume '+'
+
+	while (!scanner.isEnd() && isPhoneChar(scanner.char())) {
+		scanner.consume();
+	}
+
+	const raw = scanner.sliceFrom(start); // includes the leading '+'
+
+	// The tel: target keeps only the digits.
+	let digits = '';
+	for (const ch of raw) {
+		if (isDigit(ch)) digits += ch;
+	}
+
+	// Needs at least 5 digits to count as a real phone number.
+	if (digits.length < 5) {
+		scanner.backtrack(start);
+		return null;
+	}
+
+	return link('tel:' + digits, [plain(raw)]);
 }
 
 // ------ Block methods ----------------------------------------------------
