@@ -32,6 +32,8 @@ import {
 	Spoiler,
 	SpoilerBlock,
 	Strike,
+	Table,
+	TableCell,
 	Tasks,
 	Timestamp,
 	UnorderedList,
@@ -69,6 +71,7 @@ import {
 	spoiler,
 	spoilerBlock,
 	strike,
+	table,
 	task,
 	tasks,
 	timestamp,
@@ -181,6 +184,12 @@ export function parse(input: string, options: Options = {}) {
 		const horizontalRuleNode: HorizontalRule | null = tryHorizontalRule(scanner);
 		if (horizontalRuleNode !== null) {
 			root.push(horizontalRuleNode);
+			continue;
+		}
+
+		const tableNode: Table | null = tryTable(scanner, options);
+		if (tableNode !== null) {
+			root.push(tableNode);
 			continue;
 		}
 
@@ -1821,4 +1830,108 @@ function tryHorizontalRule(scanner: Scanner): HorizontalRule | null {
 
 	consumeEndOfLine(scanner);
 	return horizontalRule([dashStart, dashEnd]);
+}
+
+// One "| a | b |" line → array of cells (each cell's inline content), or null.
+function parseTableRow(scanner: Scanner, options: Options): Inlines[][] | null {
+	const start = scanner.position();
+	if (scanner.char() !== '|') return null;
+	scanner.consume(); // opening '|'
+
+	const cells: Inlines[][] = [];
+	while (true) {
+		// Collect raw cell text up to an unescaped '|' or end of line.
+		let text = '';
+		let closed = false;
+		while (!scanner.isEnd() && !isNewline(scanner.char())) {
+			if (scanner.char() === '\\' && scanner.charAt(1) === '|') {
+				text += '|'; // escaped pipe stays literal
+				scanner.consume(2);
+				continue;
+			}
+			if (scanner.char() === '|') {
+				closed = true;
+				break;
+			}
+			text += scanner.char();
+			scanner.consume();
+		}
+
+		if (!closed) {
+			scanner.backtrack(start); // no closing '|' → not a valid row
+			return null;
+		}
+		scanner.consume(); // consume '|'
+
+		cells.push(parseInline(new Scanner(text), options));
+
+		if (scanner.isEnd() || isNewline(scanner.char())) break; // trailing '|' reached
+	}
+
+	consumeEndOfLine(scanner);
+	return cells;
+}
+
+// The "| --- | :--: |" row → per-column alignment, or null.
+function parseTableDelimiter(scanner: Scanner): Array<TableCell['align']> | null {
+	const start = scanner.position();
+	if (scanner.char() !== '|') return null;
+	scanner.consume();
+
+	const aligns: Array<TableCell['align']> = [];
+	while (true) {
+		while (isSpace(scanner.char())) scanner.consume();
+
+		const left = scanner.char() === ':';
+		if (left) scanner.consume();
+
+		let dashes = 0;
+		while (scanner.char() === '-') {
+			scanner.consume();
+			dashes++;
+		}
+		if (dashes === 0) {
+			scanner.backtrack(start);
+			return null;
+		}
+
+		const right = scanner.char() === ':';
+		if (right) scanner.consume();
+
+		while (isSpace(scanner.char())) scanner.consume();
+		if (scanner.char() !== '|') {
+			scanner.backtrack(start);
+			return null;
+		}
+		scanner.consume(); // consume '|'
+
+		aligns.push(left && right ? 'center' : right ? 'right' : left ? 'left' : undefined);
+
+		if (scanner.isEnd() || isNewline(scanner.char())) break;
+	}
+
+	consumeEndOfLine(scanner);
+	return aligns;
+}
+
+function tryTable(scanner: Scanner, options: Options): Table | null {
+	const start = scanner.position();
+
+	const header = parseTableRow(scanner, options);
+	if (header === null) return null;
+
+	const aligns = parseTableDelimiter(scanner);
+	if (aligns === null) {
+		scanner.backtrack(start); // header without a delimiter row → not a table
+		return null;
+	}
+
+	const rows: Inlines[][][] = [];
+	while (true) {
+		const row = parseTableRow(scanner, options);
+		if (row === null) break;
+		rows.push(row);
+	}
+
+	return table(header, aligns, rows, [start, scanner.position()]);
 }
